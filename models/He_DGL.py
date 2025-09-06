@@ -461,9 +461,9 @@ class UnircaLab():
                 epoch_loss += total_loss.detach().item()
                 epoch_cnt += 1
             losses.append(epoch_loss / epoch_cnt)
-            if len(losses) > self.config['win_size'] and \
-                    abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
-                break
+            # if len(losses) > self.config['win_size'] and \
+            #         abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
+            #     break
         return model_ts, model_ta  
 
     def multi_train(self, dataset_ts, dataset_ta):
@@ -513,9 +513,9 @@ class UnircaLab():
                 epoch_loss += total_loss.detach().item()
                 epoch_cnt += 1
             losses.append(epoch_loss / epoch_cnt)
-            if len(losses) > self.config['win_size'] and \
-                    abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
-                break
+            # if len(losses) > self.config['win_size'] and \
+            #         abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
+            #     break
         return model
 
     def multi_trainv0(self, dataset_ts, dataset_ta):
@@ -585,9 +585,9 @@ class UnircaLab():
                 epoch_loss += total_loss.detach().item()
                 epoch_cnt += 1
             losses.append(epoch_loss / epoch_cnt)
-            if len(losses) > self.config['win_size'] and \
-                    abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
-                break
+            # if len(losses) > self.config['win_size'] and \
+            #         abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
+            #     break
         return model_ts, model_ta  
         
     def trans_train(self, dataset_src, dataset_target, retrain=False):
@@ -627,9 +627,9 @@ class UnircaLab():
                 epoch_loss += loss.detach().item()
                 epoch_cnt += 1
             losses.append(epoch_loss / epoch_cnt)
-            if len(losses) > self.config['win_size'] and \
-                    abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
-                break
+            # if len(losses) > self.config['win_size'] and \
+            #         abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
+            #     break
         # 至此源模型训练完成，开始目标模型迁移
         model_target = copy.deepcopy(model_src)
         print('retrain: ', retrain)
@@ -663,9 +663,9 @@ class UnircaLab():
                 epoch_loss += loss.detach().item()
                 epoch_cnt += 1
             losses.append(epoch_loss / epoch_cnt)
-            if len(losses) > self.config['win_size'] and \
-                    abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
-                break
+            # if len(losses) > self.config['win_size'] and \
+            #         abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
+            #     break
         
         return model_target
     
