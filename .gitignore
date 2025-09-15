@@ -103,9 +103,16 @@ ENV/
 .venv/
 
 # Logs
-*.log
-log/
+# Ignore log output but keep code
+log/*.log
+log/*.txt
+log/output/
+
 
 # Ignore config and results
-config/*.yaml
+config/local_*.yaml
 results/
+*.bak
+
+
+venvDiagFusion/

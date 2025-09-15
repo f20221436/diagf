@@ -1,15 +1,21 @@
+n_jobs: 4
+
 dataset: 'gaia'
-base_path: '.'
-demo_path: 'data/gaia/demo'
-label: 'demo_1100'
+base_path: 'C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main'
+demo_path: 'MicroSS'
+label: ''   # <-- change to your folder name under data/gaia/demo
 
 parse:
-  nodes: 'dbservice1 dbservice2 logservice1 logservice2 mobservice1 mobservice2 redisservice1 redisservice2 webservice1 webservice2'
+  nodes: 'dbservice1 dbservice2 ...'       # keep or edit
   parse_dir: 'parse'
-  metric_path: 'anomalies/demo_metric.json'
-  trace_path: 'anomalies/demo_trace.json' 
-  log_path: 'anomalies/stratification_logs.npy' 
-  save_path: 'parse/stratification_texts.pkl' 
+  log_input_dir: 'MicroSS/business'   # not originally a key, but good to add for clarity
+  log_input_path: 'MicroSS/anomalies/stratification_logs.npy'  # output produced by your processing; keep as an absolute or relative path
+  metric_path: 'MicroSS/anomalies/demo_metric.json'  # where metric_event.py will write metric JSON (adjust name if you want)
+  trace_data_dir: 'C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/trace_timeseries'    # where trace_totimeseries.py will write trace JSON
+  save_path: 'MicroSS/parse/stratification_texts.pkl' # parsed text pkl
+  trace_path: 'data/gaia/anomalies/demo_trace.json'
+  log_path: 'data/gaia/anomalies/stratification_logs.npy'
+  save_path: 'data/gaia/parse/stratification_texts.pkl'
 
 fasttext:
   supervised: True
@@ -40,10 +46,10 @@ he_dgl:
   nodes: 'dbservice1 dbservice2 logservice1 logservice2 mobservice1 mobservice2 redisservice1 redisservice2 webservice1 webservice2'
   dataset: 'gaia'
   heterogeneous: False 
-  data_dir: ''
+  data_dir: 'C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS'
   save_dir: 'dgl/stratification_10'
   Xs: 'sentence_embedding.pkl'
-  run_table: 'gaia_resplit.csv' # 'demo_train160.csv'
+  run_table: 'C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/run/gaia_resplit.csv' # 'demo_train160.csv'
   aug: False
   aug_size: 0
   N_S: 5 
@@ -64,15 +70,17 @@ event_path: 'data/gaia/events'
 feature_path: 'data/gaia/feature'
 result_path: 'result/gaia/analysis'
 exploration_path: 'exploration/gaia/pics'
-trace_path: 'data/gaia/demo/trace'
+trace_info_path: 'C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/trace/trace.csv'
+trace_data_dir: 'C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/trace'
 log_path: 'data/gaia/demo/log'
-metric_path: 'data/gaia/demo/metric'
+metric_info_path: 'C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/metric/metric.csv'
+metric_data_dir: 'C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/metric'
 feature_list:
   0: TFIDF_X
   1: BOW_X
   2: NGram_X
   3: TFIDF_BOW_NGram_X
   4: TFIDF_BOW_X
-  5: TFIDF_NGram_X,
+  5: TFIDF_NGram_X
   6: BOW_NGram_X
 feature: feature_list[0]
