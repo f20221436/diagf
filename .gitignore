@@ -91,6 +91,7 @@ cython_debug/
 *.sav
 *.dat
 *.tmp
+*.csv.prepped
 
 # System files
 .DS_Store
