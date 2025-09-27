@@ -10,9 +10,15 @@ from plot_resource_usage import plot_resource_usage
 
 if __name__ == '__main__':
     config = get_config()
-    label_path = os.path.join(config['base_path'], config['demo_path'],
-                              config['label'], config['he_dgl']['run_table'])
+    # ...existing code...
+    run_table = config['he_dgl']['run_table']
+    if os.path.isabs(run_table):
+        label_path = run_table
+    else:
+        # Use the path relative to your current project directory
+        label_path = os.path.join(os.getcwd(), run_table)
     labels = pd.read_csv(label_path, index_col=0)
+# ...existing code...
 
 
     # FASTTEXT (commented out)

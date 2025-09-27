@@ -46,10 +46,10 @@ he_dgl:
   nodes: 'dbservice1 dbservice2 logservice1 logservice2 mobservice1 mobservice2 redisservice1 redisservice2 webservice1 webservice2'
   dataset: 'gaia'
   heterogeneous: False 
-  data_dir: 'C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS'
+  data_dir: 'C:/Users/DEVESH PALO/projects/Diagf/diagf'
   save_dir: 'dgl/stratification_10'
-  Xs: 'sentence_embedding.pkl'
-  run_table: 'C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/run/gaia_resplit.csv' # 'demo_train160.csv'
+  Xs: 'diagf/data/gaia/demo/demo_1100/anomalies/sentence_embedding.pkl'
+  run_table: 'data/gaia/demo/demo_1100/gaia_resplit.csv'
   aug: False
   aug_size: 0
   N_S: 5 
