@@ -1,4 +1,4 @@
-from transforms.events import metric_trace_log_parse, fasttext_with_DA, sententce_embedding
+from transforms.events import metric_trace_log_parse, fasttext_with_DA, sentence_embedding
 from models import He_DGL
 from public_function import deal_config, get_config
 import os
@@ -18,7 +18,6 @@ if __name__ == '__main__':
         # Use the path relative to your current project directory
         label_path = os.path.join(os.getcwd(), run_table)
     labels = pd.read_csv(label_path, index_col=0)
-# ...existing code...
 
 
     # FASTTEXT (commented out)
