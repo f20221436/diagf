@@ -1,0 +1,2 @@
+﻿# Ignore large temp and data files
+complete_metric_data.json.temp
