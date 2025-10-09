@@ -204,9 +204,42 @@ class RawDataProcess():
         labels: torch.tensor()
             label列表
         """
-        meta_labels = sorted(list(set(list(run_table[label_type]))))
-        labels_idx = {label: idx for label, idx in zip(meta_labels, range(len(meta_labels)))}
-        labels = np.array(run_table[label_type].apply(lambda label_str: labels_idx[label_str]))
+        # Return numpy array of integer labels for the given label_type.
+        # Robust handling:
+        #   - If the entire column is NaN: assign '[normal]'
+        #   - If partially NaN: fill those with '[unknown]'
+        #   - Placeholders are ordered to appear last in the label index.
+        if label_type not in run_table.columns:
+            raise ValueError(f"Missing column '{label_type}' in run_table. Columns: {list(run_table.columns)}")
+
+        col = run_table[label_type]
+
+        if col.isna().all():
+            print(f"[warn] Column '{label_type}' all NaN; assigning '[normal]'.")
+            col = pd.Series(["[normal]"] * len(col), index=col.index)
+        else:
+            if col.isna().any():
+                print(f"[info] Column '{label_type}' had {int(col.isna().sum())} NaNs -> filled with '[unknown]'.")
+            col = col.fillna("[unknown]")
+
+        col = col.astype(str)
+
+        unique = sorted(set(col))
+        placeholders = ["[unknown]", "[normal]"]
+        ordered = [u for u in unique if u not in placeholders]
+        for ph in placeholders:
+            if ph in unique:
+                ordered.append(ph)
+
+        labels_idx = {v: i for i, v in enumerate(ordered)}
+        labels = col.map(labels_idx).to_numpy()
+        # Save service label list for reverse mapping later
+        if label_type == 'service':
+            try:
+                os.makedirs(self.config['save_dir'], exist_ok=True)
+                U.save_info(os.path.join(self.config['save_dir'], 'service_label_list.pkl'), ordered)
+            except Exception as e:
+                print(f"[warn] could not save service_label_list.pkl: {e}")
         return labels
 
     def get_topology(self):
@@ -308,6 +341,14 @@ class UnircaLab():
         instances = config['nodes'].split()
         self.ins_dict = dict(zip(instances, range(len(instances))))
         self.demos = pd.read_csv(os.path.join(self.config['data_dir'], self.config['run_table']), index_col=0)
+        # Load service label list if present for reverse mapping in testing
+        self.service_label_list = None
+        svc_map_file = os.path.join(self.config['save_dir'], 'service_label_list.pkl')
+        if os.path.exists(svc_map_file):
+            try:
+                self.service_label_list = U.load_info(svc_map_file)
+            except Exception as e:
+                print(f"[warn] failed to load service_label_list.pkl: {e}")
         if config['dataset'] == 'gaia':
             self.topoinfo = {0: [0, 1], 1: [2, 3], 2: [4, 5], 3: [6, 7], 4: [8, 9]}
         elif config['dataset'] == '21aiops':
@@ -316,6 +357,9 @@ class UnircaLab():
             self.topoinfo = {0: [0, 1], 1: list(range(2, 10)), 2: list(range(10, 14))}
         else:
             raise Exception('Unknow dataset')
+
+    def _get_device(self):
+        return 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
     def collate(self, samples):
         graphs, labels = map(list, zip(*samples))
@@ -333,10 +377,10 @@ class UnircaLab():
         #     return None
         if self.config['seed'] is not None:
             torch.manual_seed(self.config['seed'])
-#         print('len train_dataset=', len(dataset))
+        # print('len train_dataset=', len(dataset))
         dataloader = DataLoader(dataset, batch_size=self.config['batch_size'], collate_fn=self.collate)
-#         device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        device = 'cpu'
+        device = self._get_device()
+        print(f"[device] train using {device}")
         # print(device)
 
         in_dim = dataset.graphs[0].ndata['attr'].shape[1]
@@ -399,7 +443,8 @@ class UnircaLab():
             torch.manual_seed(self.config['seed'])
         
         weight = 0.5
-        device = 'cpu'
+        device = self._get_device()
+        print(f"[device] multi_trainv2 using {device}")
 
         dataloader_ts = DataLoader(dataset_ts, batch_size=self.config['batch_size'], collate_fn=self.collate)
         dataloader_ta = DataLoader(dataset_ta, batch_size=self.config['batch_size'], collate_fn=self.collate)
@@ -470,7 +515,8 @@ class UnircaLab():
         if self.config['seed'] is not None:
             torch.manual_seed(self.config['seed'])
         weight = 0.5
-        device = 'cpu'
+        device = self._get_device()
+        print(f"[device] multi_train using {device}")
         dataloader_ts = DataLoader(dataset_ts, batch_size=self.config['batch_size'], collate_fn=self.collate)
         dataloader_ta = DataLoader(dataset_ta, batch_size=self.config['batch_size'], collate_fn=self.collate)
         in_dim = dataset_ts.graphs[0].ndata['attr'].shape[1]
@@ -522,7 +568,8 @@ class UnircaLab():
         if self.config['seed'] is not None:
             torch.manual_seed(self.config['seed'])
         weight = 0.5
-        device = 'cpu'
+        device = self._get_device()
+        print(f"[device] multi_trainv0 using {device}")
         dataloader_ts = DataLoader(dataset_ts, batch_size=self.config['batch_size'], collate_fn=self.collate)
         dataloader_ta = DataLoader(dataset_ta, batch_size=self.config['batch_size'], collate_fn=self.collate)
         in_dim_ts = dataset_ts.graphs[0].ndata['attr'].shape[1]
@@ -594,8 +641,8 @@ class UnircaLab():
         if self.config['seed'] is not None:
             torch.manual_seed(self.config['seed'])
         dataloader_src = DataLoader(dataset_src, batch_size=self.config['batch_size'], collate_fn=self.collate)
-        device = 'cpu'
-        print(device)
+        device = self._get_device()
+        print(f"[device] trans_train using {device}")
 
         in_dim = dataset_src.graphs[0].ndata['attr'].shape[1]
         out_dim = self.config['N_A']
@@ -692,14 +739,13 @@ class UnircaLab():
         testloader = DataLoader(test_dataset, batch_size=len(test_dataset) + 10, collate_fn=self.collate)
         for batched_graph, labels in trainloader:
             train_embeds = model.get_embeds(batched_graph, batched_graph.ndata['attr'].float(), True)
-            classifier.fit(train_embeds.detach().numpy(), labels.detach().numpy())
+            classifier.fit(train_embeds.detach().cpu().numpy(), labels.detach().cpu().numpy())
         
         for batched_graph, labels in testloader:
             test_embeds = model.get_embeds(batched_graph, batched_graph.ndata['attr'].float(), True)
-#             score = classifier.score(test_embeds.detach().numpy(), labels.detach().numpy())
-#             print('score: ', score)
-            output = classifier.predict_proba(test_embeds.detach().numpy())
-            labels = labels.detach().numpy().reshape(-1, 1)
+            # Move to CPU for sklearn
+            output = classifier.predict_proba(test_embeds.detach().cpu().numpy())
+            labels = labels.detach().cpu().numpy().reshape(-1, 1)
             # print(classifier.score(test_embeds.detach().numpy(), labels))
             preds = [
                 [
@@ -726,7 +772,8 @@ class UnircaLab():
     def testv2(self, model, dataset, task, out_file, save_file=None):
         model.eval()
         dataloader = DataLoader(dataset, batch_size=len(dataset) + 10, collate_fn=self.collate)
-        device = 'cpu'
+        device = self._get_device()
+        print(f"[device] testv2 using {device}")
         seed = self.config['seed']
         accuracy = []
         for batched_graph, labels in dataloader:
@@ -739,8 +786,8 @@ class UnircaLab():
                 out_dir = os.path.join(self.config['save_dir'], 'preds')
                 if not os.path.exists(out_dir):
                     os.makedirs(out_dir)
-                y_pred = indices.detach().numpy()
-                y_true = labels.detach().numpy().reshape(-1, 1)
+                y_pred = indices.detach().cpu().numpy()
+                y_true = labels.detach().cpu().numpy().reshape(-1, 1)
                 ser_res = pd.DataFrame(np.append(y_pred, y_true, axis=1), 
                                        columns=np.append([f'Top{i}' for i in range(1, len(y_pred[0])+1)], 'GroundTruth'))
                 
@@ -753,8 +800,8 @@ class UnircaLab():
                 out_dir = os.path.join(self.config['save_dir'], 'preds')
                 if not os.path.exists(out_dir):
                     os.makedirs(out_dir)
-                y_pred = indices.detach().numpy()
-                y_true = labels.detach().numpy().reshape(-1, 1)
+                y_pred = indices.detach().cpu().numpy()
+                y_true = labels.detach().cpu().numpy().reshape(-1, 1)
                 pre = precision_score(y_pred[:, 0], y_true, average='weighted')
                 rec = recall_score(y_pred[:, 0], y_true, average='weighted')
                 f1 = f1_score(y_pred[:, 0], y_true, average='weighted')
@@ -783,8 +830,8 @@ class UnircaLab():
     def test(self, model, dataset, out_file, save_file=None):
         model.eval()
         dataloader = DataLoader(dataset, batch_size=len(dataset) + 10, collate_fn=self.collate)
-#         device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        device = 'cpu'
+        device = self._get_device()
+        print(f"[device] test using {device}")
         seed = self.config['seed']
         accuracy = []
         for batched_graph, labels in dataloader:
@@ -801,8 +848,8 @@ class UnircaLab():
                     out_dir = os.path.join(self.config['save_dir'], 'preds')
                     if not os.path.exists(out_dir):
                         os.makedirs(out_dir)
-                    y_pred = indices.detach().numpy()
-                    y_true = labels.detach().numpy().reshape(-1, 1)
+                    y_pred = indices.detach().cpu().numpy()
+                    y_true = labels.detach().cpu().numpy().reshape(-1, 1)
                     pd.DataFrame(np.append(y_pred, y_true, axis=1), columns=['Top1', 'Top2', 'Top3', 'Top4', 'Top5', 'GroundTruth']).to_csv(f'{out_dir}/seed{seed}_{out_file}')
                 num = 0
                 for i in range(len(indices)):
@@ -824,7 +871,8 @@ class UnircaLab():
         dataloader_ta = DataLoader(dataset_ta, batch_size=len(dataset_ta) + 10, collate_fn=self.collate)
         ts_samples = [(batched_graphs, labels) for batched_graphs, labels in dataloader_ts]
         ta_samples = [(batched_graphs, labels) for batched_graphs, labels in dataloader_ta]
-        device = 'cpu'
+        device = self._get_device()
+        print(f"[device] test_multitask using {device}")
         seed = self.config['seed']
         accuracy_ts = []
         accuracy_ta = []
@@ -842,8 +890,8 @@ class UnircaLab():
                     out_dir = os.path.join(self.config['save_dir'], 'preds')
                     if not os.path.exists(out_dir):
                         os.makedirs(out_dir)
-                    y_pred = indices_ts.detach().numpy()
-                    y_true = labels_ts.detach().numpy().reshape(-1, 1)
+                    y_pred = indices_ts.detach().cpu().numpy()
+                    y_true = labels_ts.detach().cpu().numpy().reshape(-1, 1)
                     # pd.DataFrame(np.append(y_pred, y_true, axis=1), columns=['Top1', 'Top2', 'Top3', 'Top4', 'Top5', 'GroundTruth']).to_csv(f'{out_dir}/multitask_seed{seed}_{out_file}')
                     ser_res = pd.DataFrame(np.append(y_pred, y_true, axis=1), columns=
                                            np.append([f'Top{i}' for i in range(1, len(y_pred[0])+1)], 'GroundTruth'))
@@ -880,42 +928,133 @@ class UnircaLab():
 
         return
 
+    # ... locate def test_instance_local(self, s_preds, max_num=2): and replace its body ...
+
     def test_instance_local(self, s_preds, max_num=2):
         """
         根据微服务的预测结果预测微服务的根因实例
+        Robust: skips rows with NaN instance; handles short ins_pred lists.
         """
-        with open(self.config['text_path'], 'rb') as f:
+        txt_path = self.config['text_path']
+        if not os.path.isabs(txt_path):
+            txt_path = os.path.join(self.config['data_dir'], txt_path)
+        if not os.path.exists(txt_path):
+            raise FileNotFoundError(f"stratification_texts file not found: {txt_path}")
+        with open(txt_path, 'rb') as f:
             info = pickle.load(f)
-        ktype = type(list(info.keys())[0])
-        test_cases = self.demos[self.demos['data_type']=='test']
-        topks = np.zeros(5)
+
+        test_cases = self.demos[self.demos['data_type'] == 'test']
+
+        # Collect results only for valid rows
+        topks = np.zeros(5, dtype=float)
         ins_preds = []
+        gt_indices = []
+        valid_case_indices = []
+
+        # Pre-calc key type and fast instance word count cache
         i = 0
-        for index, row in test_cases.iterrows():
-            index = ktype(index)
+        for idx, row in test_cases.iterrows():
+            # Skip if instance missing
+            inst_name = row.get('instance', None)
+            if pd.isna(inst_name):
+                # skip this test row
+                i += 1
+                continue
+            # Skip if instance label not in mapping
+            if inst_name not in self.ins_dict:
+                # optional: dynamically add -> uncomment next two lines if desired
+                # self.ins_dict[inst_name] = len(self.ins_dict)
+                # (but then topology / downstream metrics may misalign)
+                i += 1
+                continue
+
+            # info key casting
+            # Some datasets use datetime / numeric keys
+            info_key_type = type(list(info.keys())[0])
+            try:
+                cast_idx = info_key_type(idx)
+            except Exception:
+                cast_idx = idx
+            if cast_idx not in info:
+                i += 1
+                continue
+
+            # Build word-count dict for this case
             num_dict = {}
-            for pair in info[index]:
-                num_dict[self.ins_dict[pair[0]]] = len(info[index][pair].split())
-            s_pred = s_preds.loc[i]
+            for pair in info[cast_idx]:
+                # pair: (instance, anomalyFlag) or similar
+                inst_key = pair[0]
+                if inst_key in self.ins_dict:
+                    num_dict[self.ins_dict[inst_key]] = len(str(info[cast_idx][pair]).split())
+
+            s_pred_row = s_preds.loc[i]  # same positional order the caller built
             ins_pred = []
-            for col in list(s_preds.columns)[: -1]:
-                temp = sorted([(ins_id, num_dict[ins_id]) for ins_id in self.topoinfo[s_pred[col]]],
-                              key=lambda x: x[-1], reverse=True)
-                # print(self.topoinfo[s_pred[col]], temp)
-                ins_pred.extend([item[0] for item in temp[: max_num]])
-            ins_preds.append(ins_pred[: 5])
+
+            # Iterate predicted service columns (exclude GroundTruth)
+            for col in list(s_preds.columns)[:-1]:
+                svc_idx = s_pred_row[col]
+
+                # Skip NaN service predictions
+                if pd.isna(svc_idx):
+                    continue
+
+                # If predicted service index is integer and exists directly
+                if isinstance(svc_idx, (int, np.integer)) and svc_idx not in self.topoinfo:
+                    # Try mapping via service_label_list if stored
+                    if self.service_label_list and 0 <= svc_idx < len(self.service_label_list):
+                        # Here we just keep numeric; no direct name mapping in topology
+                        pass
+                    else:
+                        continue  # cannot map
+                if svc_idx not in self.topoinfo:
+                    continue
+
+                candidates = self.topoinfo[svc_idx]
+                if not candidates:
+                    continue
+                # Score candidates by num_dict counts (missing -> 0)
+                temp = sorted(
+                    [(ins_id, num_dict.get(ins_id, 0)) for ins_id in candidates],
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                ins_pred.extend([item[0] for item in temp[:max_num]])
+
+            # Keep only up to 5 predictions (pad or truncate)
+            ins_pred = ins_pred[:5]
+            if len(ins_pred) < 5:
+                # pad with -1 so indexing below is safe
+                ins_pred = ins_pred + [-1] * (5 - len(ins_pred))
+
+            # Record
+            ins_preds.append(ins_pred)
+            gt_idx = self.ins_dict[inst_name]
+            gt_indices.append(gt_idx)
+            valid_case_indices.append(idx)
+
+            # Update top-k accuracy curve
             for k in range(5):
-                if ins_pred[k] == self.ins_dict[row['instance']]:
-                    topks[k: ] += 1
-                    break        
-            i += 1
-        print('Top1-5: ', topks/len(test_cases))
-        y_true = np.array([self.ins_dict[ins] for ins in test_cases['instance'].values]).reshape(-1, 1)
-        return topks/len(test_cases), pd.DataFrame(np.append(
-            ins_preds, y_true, axis=1), columns=[
-                'Top1', 'Top2', 'Top3', 'Top4', 'Top5', 'GroundTruth'], index=test_cases.index)
-                
-        
+                if ins_pred[k] == gt_idx:
+                    topks[k:] += 1
+                    break
+
+            i += 1  # move to next original s_preds row
+
+        total = len(gt_indices)
+        if total == 0:
+            print("[warn] No valid test rows (all instances missing or unmapped).")
+            return np.zeros(5), pd.DataFrame(columns=['Top1','Top2','Top3','Top4','Top5','GroundTruth'])
+
+        topk_acc = topks / total
+        print('Top1-5: ', topk_acc)
+
+        y_true = np.array(gt_indices).reshape(-1, 1)
+        df = pd.DataFrame(
+            np.append(np.array(ins_preds), y_true, axis=1),
+            columns=['Top1', 'Top2', 'Top3', 'Top4', 'Top5', 'GroundTruth'],
+            index=valid_case_indices
+        )
+        return topk_acc, df    
     
     def cross_evaluate(self, s_output, s_labels, a_output, a_labels, save_file=None):
         N_S = self.config['N_S']

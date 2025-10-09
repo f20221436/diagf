@@ -47,10 +47,10 @@ he_dgl:
   nodes: 'dbservice1 dbservice2 logservice1 logservice2 mobservice1 mobservice2 redisservice1 redisservice2 webservice1 webservice2'
   dataset: 'gaia'
   heterogeneous: False 
-  data_dir: 'C:/Users/DEVESH PALO/projects/Diagf/diagf'
-  save_dir: 'dgl/stratification_10'
-  Xs: 'data/gaia/demo/demo_1100/anomalies/sentence_embedding.pkl'
-  run_table: 'data/gaia/demo/demo_1100/gaia_resplit.csv'
+  data_dir: 'C:/Users/DEVESH PALO/projects/Diagf/diagf'   # can keep
+  Xs: 'C:/Users/DEVESH PALO/projects/Diagf/diagf/data/gaia/demo/demo_1100/anomalies/sentence_embedding.pkl'
+  run_table: 'C:/Users/DEVESH PALO/projects/Diagf/diagf/data/gaia/demo/demo_1100/gaia_resplit_aligned.csv'
+  save_dir: 'C:/Users/DEVESH PALO/projects/Diagf/diagf/dgl/stratification_10'
   aug: False
   aug_size: 0
   N_S: 5 
@@ -64,7 +64,7 @@ he_dgl:
   lr: 0.001
   weight_decay: 0.0001
   seed: 2
-  text_path: 'parse/stratification_texts.pkl'
+  text_path: 'C:/Users/DEVESH PALO/projects/Diagf/diagf/data/gaia/demo/demo_1100/anomalies/stratification_texts.pkl'
 
 source_data_path: 'data/gaia/source_data'
 event_path: 'data/gaia/events'
