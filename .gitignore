@@ -92,6 +92,7 @@ cython_debug/
 *.dat
 *.tmp
 *.csv.prepped
+*.txt
 
 # System files
 .DS_Store
@@ -102,12 +103,14 @@ venv/
 ENV/
 .env/
 .venv/
+.venvDiagFusion/
 
 # Logs
 # Ignore log output but keep code
 log/*.log
 log/*.txt
 log/output/
+train_logs.txt/
 
 
 # Ignore config and results
