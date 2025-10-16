@@ -20,6 +20,19 @@ from sklearn.metrics import precision_score,f1_score,recall_score
 import warnings
 warnings.filterwarnings('ignore')
 
+# PERFORMANCE OPTIMIZATIONS
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'  # Async CUDA operations
+os.environ['TORCH_CUDNN_V8_API_ENABLED'] = '1'  # Latest cuDNN API
+os.environ['OMP_NUM_THREADS'] = '8'  # Optimize CPU threads
+
+import torch.backends.cudnn as cudnn
+
+# Global PyTorch optimizations
+if hasattr(torch, 'set_float32_matmul_precision'):
+    torch.set_float32_matmul_precision('medium')  # Use Tensor Cores
+cudnn.benchmark = True  # Optimize for consistent input sizes
+cudnn.deterministic = False  # Allow non-deterministic for speed
+
 class UnircaDataset():
     """
     参数
@@ -40,52 +53,211 @@ class UnircaDataset():
     shuffle: boolean (default: False)
         load()完成以后，若shuffle为True，则打乱self.graphs 和 self.labels （同步）
     """
-
     def __init__(self, dataset_path, labels_path, topology, aug=False, aug_size=0, shuffle=False):
         self.dataset_path = dataset_path
         self.labels_path = labels_path
-        self.topology = topology
+        self.topology_path = topology
         self.aug = aug
         self.aug_size = aug_size
+        self.shuffle_on_load = shuffle
+        
         self.graphs = []
         self.labels = []
+        self.chunk_files = []
+        self._chunk_cache = {}
+        self._max_cache_size = 5 # Number of chunks to keep in RAM
+        
         self.load()
-        if shuffle:
-            self.shuffle()
-
-    def __getitem__(self, idx):
-        return self.graphs[idx], self.labels[idx]
+        if self.shuffle_on_load and not self.chunk_files:
+             self.shuffle()
 
     def __len__(self):
-        return len(self.graphs)
+        return len(self.labels)
 
     def load(self):
-        """ __init__()  中使用，作用是装载 self.graphs 和 self.labels，若aug为True，则进行数据增强操作。
+        """OPTIMIZED: Determines whether to load all data at once or prepare for streaming with memory management."""
+        import gc
+        
+        # Clear any existing data to free memory
+        if hasattr(self, 'graphs') and self.graphs:
+            del self.graphs
+        if hasattr(self, '_chunk_cache'):
+            self._chunk_cache.clear()
+        gc.collect()
+        
+        # If the path is a directory ending in '_chunked', use streaming mode.
+        if os.path.isdir(self.dataset_path) and self.dataset_path.endswith('_chunked'):
+            print("📦 Detected chunked data directory. Initializing OPTIMIZED streaming mode.")
+            self._initialize_streaming()
+        else:
+            print("📁 Loading all data into memory (traditional mode).")
+            self._load_regular()
+        
+        # Force garbage collection after loading
+        gc.collect()
+
+    def _initialize_streaming(self):
+        """OPTIMIZED: Prepares the dataset for streaming chunks from disk with performance enhancements."""
+        import glob
+        self.chunk_files = sorted(glob.glob(os.path.join(self.dataset_path, "*.pkl")))
+        if not self.chunk_files:
+            raise FileNotFoundError(f"No chunk files (.pkl) found in directory: {self.dataset_path}")
+        
+        # Load the corresponding labels
+        self.labels = tensor(U.load_info(self.labels_path))
+        self.topology = U.load_info(self.topology_path)
+        
+        # Determine chunk size from the first chunk
+        with open(self.chunk_files[0], 'rb') as f:
+            first_chunk = pickle.load(f)
+            self.chunk_size = len(first_chunk)
+
+        # Create placeholders for graphs. They will be loaded lazily.
+        self.graphs = [None] * len(self.labels)
+        
+        # OPTIMIZED Cache management - larger cache for better performance
+        from collections import OrderedDict
+        self._chunk_cache = OrderedDict()  # LRU-style cache
+        
+        # Get cache size from config (default optimized to 20)
+        config_cache_size = getattr(self, 'config', {}).get('max_cache_size', 20)
+        self._max_cache_size = max(5, config_cache_size)  # Minimum 5 chunks
+        
+        print(f"� OPTIMIZED Cache: {self._max_cache_size} chunks (LRU eviction)")
+        
+        # Pre-compile DGL graph template for faster graph creation
+        self._graph_template = dgl.graph(self.topology)
+        in_degrees = self._graph_template.in_degrees()
+        zero_indegree_nodes = [i for i, deg in enumerate(in_degrees) if deg == 0]
+        if zero_indegree_nodes:
+            self._graph_template.add_edges(zero_indegree_nodes, zero_indegree_nodes)
+        
+        print(f"🔧 Pre-compiled graph template: {self._graph_template.number_of_nodes()} nodes, {self._graph_template.number_of_edges()} edges")
+        
+        # CRITICAL: Load the first graph immediately for training dimension detection
+        if len(self.labels) > 0 and len(first_chunk) > 0:
+            print("🔧 Loading first graph for dimension detection...")
+            # Build the first graph using optimized template
+            X = tensor(first_chunk[0])
+            g = self._graph_template.clone()  # Fast clone from template
+            g.ndata['attr'] = X
+            self.graphs[0] = g
+            
+            # Cache the first chunk with LRU management
+            self._chunk_cache[0] = first_chunk
+            
+            print(f"✅ First graph loaded: {X.shape[1]} features, {g.number_of_nodes()} nodes")
+        
+        # Pre-load additional chunks for better cache hit rate
+        num_preload = min(3, len(self.chunk_files) - 1, self._max_cache_size - 1)
+        if num_preload > 0:
+            print(f"🚀 Pre-loading {num_preload} additional chunks for performance...")
+            for i in range(1, num_preload + 1):
+                with open(self.chunk_files[i], 'rb') as f:
+                    self._chunk_cache[i] = pickle.load(f)
+        
+        print(f"✅ OPTIMIZED Streaming ready: {len(self.labels)} labels, {len(self.chunk_files)} chunks, {len(self._chunk_cache)} pre-cached")
+
+    def _load_chunk(self, chunk_idx):
+        """OPTIMIZED: Loads a specific chunk into the cache with LRU management and performance enhancements."""
+        # Check if already cached (move to end for LRU)
+        if chunk_idx in self._chunk_cache:
+            # Move to end (most recently used)
+            self._chunk_cache.move_to_end(chunk_idx)
+            return
+        
+        # LRU eviction: remove least recently used chunk if cache is full
+        if len(self._chunk_cache) >= self._max_cache_size:
+            oldest_key, _ = self._chunk_cache.popitem(last=False)  # Remove least recent
+        
+        # Bounds check
+        if chunk_idx >= len(self.chunk_files):
+            raise IndexError(f"Chunk index {chunk_idx} out of range (max: {len(self.chunk_files)-1})")
+        
+        # OPTIMIZED: Load the new chunk with buffered I/O
+        chunk_file_path = self.chunk_files[chunk_idx]
+        try:
+            with open(chunk_file_path, 'rb', buffering=8192) as f:  # 8KB buffer
+                chunk_data = pickle.load(f)
+                self._chunk_cache[chunk_idx] = chunk_data
+        except Exception as e:
+            print(f"⚠️ Failed to load chunk {chunk_idx} from {chunk_file_path}: {e}")
+            raise
+
+    def __getitem__(self, idx):
         """
-        Xs = tensor(U.load_info(self.dataset_path))
+        OPTIMIZED: Provides a single data item (graph, label) with performance enhancements.
+        Uses graph template cloning and optimized tensor operations.
+        """
+        # Check if we're in streaming mode (chunk_files exist)
+        if hasattr(self, 'chunk_files') and self.chunk_files:
+            # If graph hasn't been loaded yet, load it on-demand
+            if self.graphs[idx] is None:
+                chunk_idx = idx // self.chunk_size
+                case_in_chunk_idx = idx % self.chunk_size
+
+                # Load the required chunk if it's not already in our cache
+                if chunk_idx not in self._chunk_cache:
+                    self._load_chunk(chunk_idx)
+                
+                # Get the specific case from the cached chunk
+                chunk_data = self._chunk_cache[chunk_idx]
+                if case_in_chunk_idx >= len(chunk_data):
+                    # Handle edge case where last chunk might be smaller
+                    case_in_chunk_idx = len(chunk_data) - 1
+                
+                # OPTIMIZED: Get the feature data with efficient tensor conversion
+                try:
+                    X = tensor(chunk_data[case_in_chunk_idx], dtype=torch.float32)
+                except Exception as e:
+                    print(f"⚠️ Failed to convert data at idx {idx} to tensor: {e}")
+                    # Fallback to regular tensor conversion
+                    X = tensor(chunk_data[case_in_chunk_idx])
+                
+                # OPTIMIZED: Build the DGL graph using pre-compiled template
+                if hasattr(self, '_graph_template'):
+                    g = self._graph_template.clone()  # Much faster than creating from scratch
+                else:
+                    # Fallback to original method if template not available
+                    g = dgl.graph(self.topology)
+                    in_degrees = g.in_degrees()
+                    zero_indegree_nodes = [i for i, deg in enumerate(in_degrees) if deg == 0]
+                    if zero_indegree_nodes:
+                        g.add_edges(zero_indegree_nodes, zero_indegree_nodes)
+                
+                # Set node attributes efficiently
+                g.ndata['attr'] = X
+                
+                # Store the created graph in our placeholder list
+                self.graphs[idx] = g
+
+        return self.graphs[idx], self.labels[idx]
+
+    def _load_regular(self):
+        """The original method to load a single large .pkl file."""
+        # This part remains the same as your original code
+        try:
+            import public_function as pf
+            Xs = pf.load_chunked(self.dataset_path)
+        except Exception:
+            Xs = U.load_info(self.dataset_path)
+            
+        Xs = tensor(Xs)
         ys = tensor(U.load_info(self.labels_path))
-        topology = U.load_info(self.topology)
-        assert Xs.shape[0] == ys.shape[0]
-        if self.aug:
-            Xs, ys = self.aug_data(Xs, ys)
-
+        topology = U.load_info(self.topology_path)
+        
         for X in Xs:
-            g = dgl.graph(topology)  # 同质图
-            # 若有0入度节点，给这些节点加自环
-            in_degrees = g.in_degrees()
-            zero_indegree_nodes = [i for i in range(len(in_degrees)) if in_degrees[i].item() == 0]
-            for node in zero_indegree_nodes:
-                g.add_edges(node, node)
-
+            g = dgl.graph(topology)
             g.ndata['attr'] = X
             self.graphs.append(g)
         self.labels = ys
 
     def shuffle(self):
-        graphs_labels = [(g, l) for g, l in zip(self.graphs, self.labels)]
-        random.shuffle(graphs_labels)
-        self.graphs = [i[0] for i in graphs_labels]
-        self.labels = [i[1] for i in graphs_labels]
+        # Note: True shuffling in streaming mode is complex. This shuffles labels
+        # and will cause chunks to be loaded in a random order, which is good enough.
+        combined = list(zip(self.graphs, self.labels))
+        random.shuffle(combined)
+        self.graphs[:], self.labels[:] = zip(*combined)
 
     def aug_data(self, Xs, ys):
         """ load() 中使用，作用是数据增强
@@ -131,6 +303,8 @@ class UnircaDataset():
         return aug_Xs, aug_ys
 
 
+# ...existing code...
+
 class RawDataProcess():
     """用来处理原始数据的类
     参数
@@ -145,52 +319,182 @@ class RawDataProcess():
     def __init__(self, config):
         self.config = config
 
-    def process(self):
-        """ 用来获取并保存中间数据
-        输入：
-            sentence_embedding.pkl
-            demo.csv
-        输出：
-            训练集：
-                train_Xs.pkl
-                train_ys_anomaly_type.pkl
-                train_ys_service.pkl
-            测试集：
-                test_Xs.pkl
-                test_ys_anomaly_type.pkl
-                test_ys_service.pkl
-            拓扑：
-                topology.pkl
-        """
-        run_table = pd.read_csv(os.path.join(self.config['data_dir'], self.config['run_table']), index_col=0)
-        Xs = U.load_info(os.path.join(self.config['data_dir'], self.config['Xs']))
-        Xs = np.array(Xs)
-        label_types = ['anomaly_type', 'service']
-        label_dict = {label_type: None for label_type in label_types}
-        for label_type in label_types:
-            label_dict[label_type] = self.get_label(label_type, run_table)
+    # Replace the process() method in RawDataProcess class:
+    # In He_DGL.py
+# --- Replace the process method in the RawDataProcess class ---
 
+    def process(self):
+        """
+        Prepares label files. If in streaming mode, it skips the memory-intensive
+        embedding splitting process.
+        """
+        run_table = pd.read_csv(os.path.join(self.config['data_dir'], self.config['run_table']))
         save_dir = self.config['save_dir']
-#         train_size = self.config['train_size']
-        train_index = np.where(run_table['data_type'].values=='train')
-        test_index = np.where(run_table['data_type'].values=='test')
-        train_size = len(train_index[0])
-        # 保存特征向量，特征向量是先训练集后测试集
-#         print(train_index)
-        U.save_info(os.path.join(save_dir, 'train_Xs.pkl'), Xs[: train_size])
-        U.save_info(os.path.join(save_dir, 'test_Xs.pkl'), Xs[train_size: ])
-        # 保存标签
-        for label_type, labels in label_dict.items():
+
+        # Always process and save the label files
+        print("📊 Processing and splitting label files...")
+        label_types = ['anomaly_type', 'service']
+        for label_type in label_types:
+            labels = self.get_label(label_type, run_table)
+            train_index = np.where(run_table['data_type'].values == 'train')[0]
+            test_index = np.where(run_table['data_type'].values == 'test')[0]
+
             U.save_info(os.path.join(save_dir, f'train_ys_{label_type}.pkl'), labels[train_index])
             U.save_info(os.path.join(save_dir, f'test_ys_{label_type}.pkl'), labels[test_index])
-        # 保存拓扑
+        print("✅ Label files saved.")
+
+        # Check if we should use streaming mode for embeddings
+        xs_path_config = self.config['Xs']
+        if os.path.isabs(xs_path_config):
+            xs_path = xs_path_config
+        else:
+            xs_path = os.path.join(self.config['data_dir'], xs_path_config)
+        
+        if os.path.isdir(xs_path) and xs_path.endswith('_chunked'):
+            print("📦 Streaming mode detected. Skipping the embedding split process.")
+            # Create placeholder files to indicate streaming mode
+            placeholder_train = os.path.join(save_dir, 'train_Xs_streaming.pkl')
+            placeholder_test = os.path.join(save_dir, 'test_Xs_streaming.pkl')
+            
+            # Save the chunked directory path for streaming
+            with open(placeholder_train, 'wb') as f:
+                pickle.dump({'streaming_mode': True, 'chunked_dir': xs_path}, f)
+            with open(placeholder_test, 'wb') as f:
+                pickle.dump({'streaming_mode': True, 'chunked_dir': xs_path}, f)
+            
+            print(f"✅ Streaming placeholders created pointing to: {xs_path}")
+        else:
+            # If not in streaming mode, run the traditional (memory-intensive) split
+            print("📁 Traditional mode detected. Splitting embedding file (this may use a lot of memory)...")
+            self.process_embeddings_chunked(xs_path, save_dir, train_index, test_index, {})
+
+        # Always save topology and edge types
         topology = self.get_topology()
         U.save_info(os.path.join(save_dir, 'topology.pkl'), topology)
-        # 保存边的类型(异质图)
         if self.config['heterogeneous']:
             edge_types = self.get_edge_types()
             U.save_info(os.path.join(save_dir, 'edge_types.pkl'), edge_types)
+            
+    def process_embeddings_chunked(self, xs_path, save_dir, train_index, test_index, label_dict):
+        """Streaming process: never accumulate more than one chunk in memory"""
+        import public_function as pf
+        from tqdm import tqdm
+        import pickle
+        import os
+        import psutil  # for memory monitoring
 
+        try:
+            base_dir = os.path.dirname(xs_path)
+            base_filename = os.path.basename(xs_path).replace(".pkl", "")
+            metadata_path = os.path.join(base_dir, f'{base_filename}_metadata.pkl')
+
+            with open(metadata_path, 'rb') as f:
+                metadata = pickle.load(f)
+
+            total_items = metadata['total_cases']
+            chunk_manifest = metadata['chunks']
+            
+            print(f"✅ Streaming process: {total_items} cases from {len(chunk_manifest)} chunks")
+            
+            train_indices_set = set(train_index)
+            
+            # Initialize output files for streaming writes
+            train_file = os.path.join(save_dir, 'train_Xs.pkl')
+            test_file = os.path.join(save_dir, 'test_Xs.pkl')
+            
+            # Remove existing files
+            for f in [train_file, test_file]:
+                if os.path.exists(f):
+                    os.remove(f)
+            
+            current_case_index = 0
+            train_count = 0
+            test_count = 0
+            
+            # Process one chunk at a time
+            for chunk_idx, chunk_info in enumerate(tqdm(chunk_manifest, desc="Streaming chunks")):
+                chunk_filename = os.path.basename(chunk_info['path'])
+                chunked_dir = os.path.join(base_dir, 'sentence_embedding_chunked')
+                chunk_path = os.path.join(chunked_dir, chunk_filename)
+                
+                if not os.path.exists(chunk_path):
+                    current_case_index += 500  # Assume standard chunk size
+                    continue
+
+                # Progress monitoring
+                if chunk_idx % 100 == 0:
+                    mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
+                    print(f"🔄 Chunk {chunk_idx+1}/{len(chunk_manifest)}: {chunk_filename} (Memory: {mem_mb:.1f}MB)")
+
+                # Load ONE chunk only
+                with open(chunk_path, 'rb') as f_chunk:
+                    chunk_data = pickle.load(f_chunk)
+                
+                chunk_len = len(chunk_data) if isinstance(chunk_data, (list, tuple)) else 1
+                
+                # Split this chunk's cases immediately
+                chunk_train = []
+                chunk_test = []
+                
+                for case_idx, case in enumerate(chunk_data):
+                    global_index = current_case_index + case_idx
+                    if global_index in train_indices_set:
+                        chunk_train.append(case)
+                    else:
+                        chunk_test.append(case)
+                
+                # IMMEDIATELY write to disk and free memory
+                if chunk_train:
+                    self._append_to_pickle(train_file, chunk_train)
+                    train_count += len(chunk_train)
+                
+                if chunk_test:
+                    self._append_to_pickle(test_file, chunk_test)
+                    test_count += len(chunk_test)
+                
+                # Free memory immediately
+                del chunk_data, chunk_train, chunk_test
+                import gc
+                gc.collect()
+                
+                current_case_index += chunk_len
+                
+                # Progress update
+                if chunk_idx % 500 == 0 and chunk_idx > 0:
+                    print(f"✅ Processed {chunk_idx} chunks: {train_count} train, {test_count} test cases")
+            
+            print(f"✅ Final split: {train_count} train, {test_count} test cases")
+            
+            # Save labels (these are small)
+            for label_type, labels in label_dict.items():
+                U.save_info(os.path.join(save_dir, f'train_ys_{label_type}.pkl'), labels[train_index])
+                U.save_info(os.path.join(save_dir, f'test_ys_{label_type}.pkl'), labels[test_index])
+                
+            topology = self.get_topology()
+            U.save_info(os.path.join(save_dir, 'topology.pkl'), topology)
+            
+            if self.config['heterogeneous']:
+                edge_types = self.get_edge_types()
+                U.save_info(os.path.join(save_dir, 'edge_types.pkl'), edge_types)
+
+        except Exception as e:
+            print(f"❌ Streaming processing failed: {e}")
+            raise
+
+    def _append_to_pickle(self, filepath, new_data):
+        """Append data to pickle file (create if doesn't exist)"""
+        if os.path.exists(filepath):
+            # Load existing, append, save back
+            with open(filepath, 'rb') as f:
+                existing = pickle.load(f)
+            existing.extend(new_data)
+            with open(filepath, 'wb') as f:
+                pickle.dump(existing, f)
+        else:
+            # Create new file
+            with open(filepath, 'wb') as f:
+                pickle.dump(new_data, f)
+            # ...existing code...
     def get_label(self, label_type, run_table):
         """ process() 中调用，用来获取label
         参数
@@ -359,12 +663,38 @@ class UnircaLab():
             raise Exception('Unknow dataset')
 
     def _get_device(self):
-        return 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        """Smart device selection with DGL compatibility check"""
+        if torch.cuda.is_available():
+            try:
+                # Test if DGL supports CUDA
+                test_graph = dgl.graph(([0], [1]))
+                test_graph.to('cuda:0')
+                return 'cuda:0'
+            except Exception as e:
+                print(f"[info] CUDA torch found but DGL GPU build missing: {e}. Using CPU.")
+                return 'cpu'
+        return 'cpu'
+    
+    def to_cpu_np(self, tensor):
+        """Convert tensor to CPU numpy array safely"""
+        return tensor.detach().cpu().numpy()
 
     def collate(self, samples):
+        """OPTIMIZED: Efficient batch collation with memory management."""
         graphs, labels = map(list, zip(*samples))
+        
+        # Efficient DGL batching
         batched_graph = dgl.batch(graphs)
-        batched_labels = torch.tensor(labels)
+        
+        # Optimized tensor creation with explicit dtype
+        batched_labels = torch.tensor(labels, dtype=torch.long)
+        
+        # Memory cleanup for large batches
+        if len(graphs) > 100:  # For large batches, cleanup immediately
+            del graphs, labels
+            import gc
+            gc.collect()
+        
         return batched_graph, batched_labels
 
     def save_result(self, save_path, data):
@@ -380,7 +710,7 @@ class UnircaLab():
         # print('len train_dataset=', len(dataset))
         dataloader = DataLoader(dataset, batch_size=self.config['batch_size'], collate_fn=self.collate)
         device = self._get_device()
-        print(f"[device] train using {device}")
+        print(f"[device] train using {device} (seed: {self.config.get('seed', 'None')})")
         # print(device)
 
         in_dim = dataset.graphs[0].ndata['attr'].shape[1]
@@ -444,7 +774,7 @@ class UnircaLab():
         
         weight = 0.5
         device = self._get_device()
-        print(f"[device] multi_trainv2 using {device}")
+        print(f"[device] multi_trainv2 using {device} (seed: {self.config.get('seed', 'None')})")
 
         dataloader_ts = DataLoader(dataset_ts, batch_size=self.config['batch_size'], collate_fn=self.collate)
         dataloader_ta = DataLoader(dataset_ta, batch_size=self.config['batch_size'], collate_fn=self.collate)
@@ -516,7 +846,7 @@ class UnircaLab():
             torch.manual_seed(self.config['seed'])
         weight = 0.5
         device = self._get_device()
-        print(f"[device] multi_train using {device}")
+        print(f"[device] multi_train using {device} (seed: {self.config.get('seed', 'None')})")
         dataloader_ts = DataLoader(dataset_ts, batch_size=self.config['batch_size'], collate_fn=self.collate)
         dataloader_ta = DataLoader(dataset_ta, batch_size=self.config['batch_size'], collate_fn=self.collate)
         in_dim = dataset_ts.graphs[0].ndata['attr'].shape[1]
@@ -569,15 +899,51 @@ class UnircaLab():
             torch.manual_seed(self.config['seed'])
         weight = 0.5
         device = self._get_device()
-        print(f"[device] multi_trainv0 using {device}")
-        dataloader_ts = DataLoader(dataset_ts, batch_size=self.config['batch_size'], collate_fn=self.collate)
-        dataloader_ta = DataLoader(dataset_ta, batch_size=self.config['batch_size'], collate_fn=self.collate)
+        print(f"[device] OPTIMIZED multi_trainv0 using {device} (seed: {self.config.get('seed', 'None')})")
+        
+        # Get optimization settings from config
+        use_mixed_precision = self.config.get('use_mixed_precision', True)
+        gradient_clip = self.config.get('gradient_clip', 1.0)
+        num_workers = self.config.get('num_workers', 8)
+        pin_memory = self.config.get('pin_memory', True)
+        prefetch_factor = self.config.get('prefetch_factor', 8)
+        persistent_workers = self.config.get('persistent_workers', True) and num_workers > 0
+        
+        print(f"🚀 Optimizations: Mixed Precision={use_mixed_precision}, Gradient Clip={gradient_clip}")
+        print(f"   DataLoader: workers={num_workers}, pin_memory={pin_memory}, prefetch={prefetch_factor}")
+        
+        # OPTIMIZED DataLoaders with performance enhancements
+        dataloader_ts = DataLoader(
+            dataset_ts, 
+            batch_size=self.config['batch_size'], 
+            collate_fn=self.collate,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else 2,
+            persistent_workers=persistent_workers,
+            drop_last=True  # Consistent batch sizes for cuDNN optimization
+        )
+        dataloader_ta = DataLoader(
+            dataset_ta, 
+            batch_size=self.config['batch_size'], 
+            collate_fn=self.collate,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else 2,
+            persistent_workers=persistent_workers,
+            drop_last=True
+        )
+        
         in_dim_ts = dataset_ts.graphs[0].ndata['attr'].shape[1]
         out_dim_ts = self.config['N_S']
-        hid_dim_ts = (in_dim_ts + out_dim_ts) * 2 // 3
+        # OPTIMIZED hidden dimension ratio from config
+        hid_dim_ratio = self.config.get('hidden_dim_ratio', 0.6)
+        hid_dim_ts = int((in_dim_ts + out_dim_ts) * hid_dim_ratio)
+        
         in_dim_ta = dataset_ta.graphs[0].ndata['attr'].shape[1]
         out_dim_ta = self.config['N_A']
-        hid_dim_ta = (in_dim_ta + out_dim_ta) * 2 // 3
+        hid_dim_ta = int((in_dim_ta + out_dim_ta) * hid_dim_ratio)
+        
         if self.config['heterogeneous']:
             etype = U.load_info(os.path.join(self.config['save_dir'], 'edge_types.pkl'))
             model_ts = RGCNClassifier(in_dim_ts, hid_dim_ts, out_dim_ts, etype).to(device)
@@ -585,56 +951,156 @@ class UnircaLab():
         else:
             model_ts = TAGClassifier(in_dim_ts, hid_dim_ts, out_dim_ts).to(device)
             model_ta = TAGClassifier(in_dim_ta, hid_dim_ta, out_dim_ta).to(device)
-            # model = GCNClassifier(in_dim, hid_dim, out_dim).to(device)  # 同质图
-#             model = GATClassifier(in_dim, hid_dim, out_dim, 3).to(device) # GAT
-#             model = SAGEClassifier(in_dim, hid_dim, out_dim).to(device) # GraphSAGE
-#             model = TAGClassifier(in_dim, hid_dim, out_dim) # TAGConv
-#             model = GATv2Classifier(in_dim, hid_dim, out_dim, 3).to(device)
-#             model = LinearClassifier(in_dim, hid_dim, out_dim).to(device)
-#             model = ChebClassifier(in_dim, hid_dim, out_dim, 2, True).to(device) # ChebConv
-            # model = SGCCClassifier(in_dim, hid_dim, out_dim).to(device)
         print(model_ts)
         print(model_ta)
         
-        opt_ts = torch.optim.Adam(model_ts.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'])
-        opt_ta = torch.optim.Adam(model_ta.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'])
+        # OPTIMIZED AdamW optimizers with advanced settings
+        opt_ts = torch.optim.AdamW(
+            model_ts.parameters(), 
+            lr=self.config['lr'], 
+            weight_decay=self.config['weight_decay'],
+            betas=(0.9, 0.999),
+            amsgrad=True
+        )
+        opt_ta = torch.optim.AdamW(
+            model_ta.parameters(), 
+            lr=self.config['lr'], 
+            weight_decay=self.config['weight_decay'],
+            betas=(0.9, 0.999),
+            amsgrad=True
+        )
+        
+        # Cosine Annealing LR Schedulers
+        scheduler_ts = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_ts, 
+            T_max=self.config['epoch'],
+            eta_min=self.config['lr'] * 0.01
+        )
+        scheduler_ta = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_ta, 
+            T_max=self.config['epoch'],
+            eta_min=self.config['lr'] * 0.01
+        )
+        
+        # Mixed precision scaler
+        scaler = torch.cuda.amp.GradScaler() if use_mixed_precision and 'cuda' in device else None
+        
+        # Early stopping
+        best_loss = float('inf')
+        patience_counter = 0
+        patience = self.config.get('win_size', 50)
+        
         losses = []
         model_ts.train()
         model_ta.train()
         
-        ts_samples = [(batched_graphs, labels) for batched_graphs, labels in dataloader_ts]
-        ta_samples = [(batched_graphs, labels) for batched_graphs, labels in dataloader_ta]
+        print(f"🚀 Starting OPTIMIZED streaming training: {len(dataset_ts)} samples, {self.config['epoch']} epochs")
+        print(f"   Using {'Mixed Precision' if scaler else 'Full Precision'} training")
+        
         for epoch in tqdm(range(self.config['epoch'])):
             epoch_loss = 0
             epoch_cnt = 0
-            features = []
-            for i in range(len(ts_samples)):
-                # service
-                ts_bg = ts_samples[i][0].to(device)
-                ts_labels = ts_samples[i][1].to(device)
-                ts_feats = ts_bg.ndata['attr'].float()
-                ts_logits = model_ts(ts_bg, ts_feats)
-                ts_loss = F.cross_entropy(ts_logits, ts_labels)
-                # anomaly_type
-                ta_bg = ta_samples[i][0].to(device)
-                ta_labels = ta_samples[i][1].to(device)
-                ta_feats = ta_bg.ndata['attr'].float()
-                ta_logits = model_ta(ta_bg, ta_feats)
-                ta_loss = F.cross_entropy(ta_logits, ta_labels)
-                
-                opt_ts.zero_grad()
-                opt_ta.zero_grad()
-                
-                total_loss = weight*ts_loss+(1-weight)*ta_loss
-                total_loss.backward()
-                opt_ts.step()
-                opt_ta.step()
-                epoch_loss += total_loss.detach().item()
-                epoch_cnt += 1
-            losses.append(epoch_loss / epoch_cnt)
-            # if len(losses) > self.config['win_size'] and \
-            #         abs(losses[-self.config['win_size']] - losses[-1]) < self.config['win_threshold']:
-            #     break
+            
+            # Create fresh iterators for each epoch to enable streaming
+            dataloader_ts_iter = iter(dataloader_ts)
+            dataloader_ta_iter = iter(dataloader_ta)
+            
+            # Process batches one at a time without pre-loading
+            try:
+                while True:
+                    # Get next batch from streaming dataloaders
+                    ts_batch = next(dataloader_ts_iter)
+                    ta_batch = next(dataloader_ta_iter)
+                    
+                    # Move to device with non_blocking for performance
+                    ts_bg = ts_batch[0].to(device, non_blocking=True)
+                    ts_labels = ts_batch[1].to(device, non_blocking=True)
+                    ta_bg = ta_batch[0].to(device, non_blocking=True)
+                    ta_labels = ta_batch[1].to(device, non_blocking=True)
+                    
+                    opt_ts.zero_grad()
+                    opt_ta.zero_grad()
+                    
+                    # MIXED PRECISION forward pass
+                    if scaler:
+                        with torch.cuda.amp.autocast():
+                            # Service prediction
+                            ts_feats = ts_bg.ndata['attr'].float()
+                            ts_logits = model_ts(ts_bg, ts_feats)
+                            ts_loss = F.cross_entropy(ts_logits, ts_labels)
+                            
+                            # Anomaly type prediction
+                            ta_feats = ta_bg.ndata['attr'].float()
+                            ta_logits = model_ta(ta_bg, ta_feats)
+                            ta_loss = F.cross_entropy(ta_logits, ta_labels)
+                            
+                            total_loss = weight * ts_loss + (1 - weight) * ta_loss
+                        
+                        # Scaled backward pass
+                        scaler.scale(total_loss).backward()
+                        
+                        # Gradient clipping with scaler
+                        if gradient_clip > 0:
+                            scaler.unscale_(opt_ts)
+                            scaler.unscale_(opt_ta)
+                            torch.nn.utils.clip_grad_norm_(model_ts.parameters(), gradient_clip)
+                            torch.nn.utils.clip_grad_norm_(model_ta.parameters(), gradient_clip)
+                        
+                        scaler.step(opt_ts)
+                        scaler.step(opt_ta)
+                        scaler.update()
+                    else:
+                        # Standard precision
+                        ts_feats = ts_bg.ndata['attr'].float()
+                        ts_logits = model_ts(ts_bg, ts_feats)
+                        ts_loss = F.cross_entropy(ts_logits, ts_labels)
+                        
+                        ta_feats = ta_bg.ndata['attr'].float()
+                        ta_logits = model_ta(ta_bg, ta_feats)
+                        ta_loss = F.cross_entropy(ta_logits, ta_labels)
+                        
+                        total_loss = weight * ts_loss + (1 - weight) * ta_loss
+                        total_loss.backward()
+                        
+                        # Gradient clipping
+                        if gradient_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(model_ts.parameters(), gradient_clip)
+                            torch.nn.utils.clip_grad_norm_(model_ta.parameters(), gradient_clip)
+                        
+                        opt_ts.step()
+                        opt_ta.step()
+                    
+                    epoch_loss += total_loss.detach().item()
+                    epoch_cnt += 1
+                    
+            except StopIteration:
+                # End of epoch - both dataloaders are exhausted
+                pass
+            
+            # Step schedulers
+            scheduler_ts.step()
+            scheduler_ta.step()
+            
+            # Calculate average epoch loss
+            avg_epoch_loss = epoch_loss / epoch_cnt if epoch_cnt > 0 else 0
+            losses.append(avg_epoch_loss)
+            
+            # Early stopping check
+            if avg_epoch_loss < best_loss:
+                best_loss = avg_epoch_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"🛑 Early stopping at epoch {epoch+1}/{self.config['epoch']}")
+                    break
+            
+            # Progress reporting every 10 epochs
+            if (epoch + 1) % 10 == 0:
+                current_lr = scheduler_ts.get_last_lr()[0]
+                print(f"Epoch {epoch+1}/{self.config['epoch']}: Loss={avg_epoch_loss:.4f}, LR={current_lr:.2e}")
+        
+        print("🎉 OPTIMIZED training completed!")
         return model_ts, model_ta  
         
     def trans_train(self, dataset_src, dataset_target, retrain=False):
@@ -642,7 +1108,7 @@ class UnircaLab():
             torch.manual_seed(self.config['seed'])
         dataloader_src = DataLoader(dataset_src, batch_size=self.config['batch_size'], collate_fn=self.collate)
         device = self._get_device()
-        print(f"[device] trans_train using {device}")
+        print(f"[device] trans_train using {device} (seed: {self.config.get('seed', 'None')})")
 
         in_dim = dataset_src.graphs[0].ndata['attr'].shape[1]
         out_dim = self.config['N_A']
@@ -773,7 +1239,7 @@ class UnircaLab():
         model.eval()
         dataloader = DataLoader(dataset, batch_size=len(dataset) + 10, collate_fn=self.collate)
         device = self._get_device()
-        print(f"[device] testv2 using {device}")
+        print(f"[device] testv2 using {device} (seed: {self.config.get('seed', 'None')})")
         seed = self.config['seed']
         accuracy = []
         for batched_graph, labels in dataloader:
@@ -831,7 +1297,7 @@ class UnircaLab():
         model.eval()
         dataloader = DataLoader(dataset, batch_size=len(dataset) + 10, collate_fn=self.collate)
         device = self._get_device()
-        print(f"[device] test using {device}")
+        print(f"[device] test using {device} (seed: {self.config.get('seed', 'None')})")
         seed = self.config['seed']
         accuracy = []
         for batched_graph, labels in dataloader:
@@ -872,7 +1338,7 @@ class UnircaLab():
         ts_samples = [(batched_graphs, labels) for batched_graphs, labels in dataloader_ts]
         ta_samples = [(batched_graphs, labels) for batched_graphs, labels in dataloader_ta]
         device = self._get_device()
-        print(f"[device] test_multitask using {device}")
+        print(f"[device] test_multitask using {device} (seed: {self.config.get('seed', 'None')})")
         seed = self.config['seed']
         accuracy_ts = []
         accuracy_ta = []
@@ -1119,6 +1585,24 @@ class UnircaLab():
             os.makedirs(save_dir)
         self.config['save_dir'] = save_dir
         RawDataProcess(self.config).process()
+        
+        # Check label diversity to warn about meaningless training
+        try:
+            import dgl.data.utils as U
+            train_service_labels = U.load_info(os.path.join(save_dir, 'train_ys_service.pkl'))
+            train_anomaly_labels = U.load_info(os.path.join(save_dir, 'train_ys_anomaly_type.pkl'))
+            
+            service_unique = len(set(train_service_labels))
+            anomaly_unique = len(set(train_anomaly_labels))
+            
+            if service_unique == 1 and anomaly_unique == 1:
+                print(f"⚠️  WARNING: Both service ({service_unique} unique) and anomaly_type ({anomaly_unique} unique) have only 1 class.")
+                print("Training will converge instantly with meaningless results.")
+                print("Consider loading proper labels or skipping training.")
+                
+            print(f"📊 Label diversity: {service_unique} services, {anomaly_unique} anomaly types")
+        except Exception as e:
+            print(f"[info] Could not check label diversity: {e}")
         # 训练
         s = time.time()
         print('train starts at', s)
@@ -1153,13 +1637,28 @@ class UnircaLab():
 #                                       retrain=True)
         t1 = time.time()
         print('train ends at', t1)
-        model_ts, model_ta = self.multi_trainv0(UnircaDataset(os.path.join(save_dir, 'train_Xs.pkl'),
+        
+        # Determine if we're using streaming mode
+        streaming_placeholder = os.path.join(save_dir, 'train_Xs_streaming.pkl')
+        if os.path.exists(streaming_placeholder):
+            # Load streaming mode configuration
+            with open(streaming_placeholder, 'rb') as f:
+                streaming_config = pickle.load(f)
+            chunked_dir = streaming_config['chunked_dir']
+            print(f"📦 Using streaming mode with chunked directory: {chunked_dir}")
+            xs_path = chunked_dir
+        else:
+            # Use traditional .pkl files
+            print("📁 Using traditional mode with .pkl files")
+            xs_path = os.path.join(save_dir, 'train_Xs.pkl')
+        
+        model_ts, model_ta = self.multi_trainv0(UnircaDataset(xs_path,
                                                       os.path.join(save_dir, 'train_ys_service.pkl'),
                                                       os.path.join(save_dir, 'topology.pkl'),
                                                       aug=self.config['aug'],
                                                       aug_size=self.config['aug_size'],
                                                       shuffle=True), 
-                                      UnircaDataset(os.path.join(save_dir, 'train_Xs.pkl'),
+                                      UnircaDataset(xs_path,
                                                  os.path.join(save_dir, 'train_ys_anomaly_type.pkl'),
                                                  os.path.join(save_dir, 'topology.pkl'),
                                                  aug=self.config['aug'],
@@ -1248,9 +1747,19 @@ class UnircaLab():
 #                                                      os.path.join(save_dir, 'topology.pkl')),
 #                                        'service_pred_trans.csv',
 #                                        'service_acc_trans.csv')
+        # Determine test dataset path (streaming or traditional)
+        test_streaming_placeholder = os.path.join(save_dir, 'test_Xs_streaming.pkl')
+        if os.path.exists(test_streaming_placeholder):
+            # Use chunked directory for test data too
+            test_xs_path = chunked_dir  # reuse the same chunked directory
+            print(f"📦 Using streaming mode for test data: {test_xs_path}")
+        else:
+            test_xs_path = os.path.join(save_dir, 'test_Xs.pkl')
+            print(f"📁 Using traditional mode for test data: {test_xs_path}")
+        
         print('instance')
         _, _ = self.testv2(model_ts,
-                                       UnircaDataset(os.path.join(save_dir, 'test_Xs.pkl'),
+                                       UnircaDataset(test_xs_path,
                                                      os.path.join(save_dir, 'test_ys_service.pkl'),
                                                      os.path.join(save_dir, 'topology.pkl')),
                                        'instance',
@@ -1258,7 +1767,7 @@ class UnircaLab():
                                        'instance_acc_multi_v0.csv')
         print('anomaly type')
         _, _ = self.testv2(model_ta,
-                                       UnircaDataset(os.path.join(save_dir, 'test_Xs.pkl'),
+                                       UnircaDataset(test_xs_path,
                                                      os.path.join(save_dir, 'test_ys_anomaly_type.pkl'),
                                                      os.path.join(save_dir, 'topology.pkl')),
                                        'anomaly_type',

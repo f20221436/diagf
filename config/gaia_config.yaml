@@ -38,8 +38,8 @@ fasttext:
 
 sentence_embedding:
   K_S: 10 
-  train_path: 'fasttext/temp/train.txt'
-  test_path: 'fasttext/temp/test.txt'
+  train_path: 'data/gaia/demo/demo_1100/anomalies/train_logs.txt'    # ✅ Use your existing files
+  test_path: 'data/gaia/demo/demo_1100/anomalies/test_logs.txt'
   source_path: 'fasttext/event_embedding.pkl'
   save_path: 'sentence_embedding.pkl'
 
@@ -48,7 +48,7 @@ he_dgl:
   dataset: 'gaia'
   heterogeneous: False 
   data_dir: 'C:/Users/DEVESH PALO/projects/Diagf/diagf'   # can keep
-  Xs: 'C:/Users/DEVESH PALO/projects/Diagf/diagf/data/gaia/demo/demo_1100/anomalies/sentence_embedding.pkl'
+  Xs: 'data/gaia/demo/demo_1100/anomalies/sentence_embedding_chunked'
   run_table: 'C:/Users/DEVESH PALO/projects/Diagf/diagf/data/gaia/demo/demo_1100/gaia_resplit_aligned.csv'
   save_dir: 'C:/Users/DEVESH PALO/projects/Diagf/diagf/dgl/stratification_10'
   aug: False
@@ -57,12 +57,32 @@ he_dgl:
   N_A: 5
   TOPK_SA: 10
   save_model: False
-  epoch: 6000 
-  batch_size: 1000 
-  win_size: 10
-  win_threshold: 0.0001
-  lr: 0.001
+  
+  # PERFORMANCE OPTIMIZATIONS
+  epoch: 1000              # Reduced from 6000 as requested
+  batch_size: 2048         # Increased for better GPU utilization
+  lr: 0.01                 # Increased learning rate for faster convergence
   weight_decay: 0.0001
+  
+  # Data loading optimizations
+  num_workers: 0           # Disable multiprocessing to avoid Windows memory issues
+  pin_memory: true         # Faster GPU transfer
+  prefetch_factor: 2       # Reduced for single-threaded mode
+  persistent_workers: false # Disabled since num_workers is 0
+  
+  # Early stopping for efficiency
+  win_size: 50             # Increased window for better convergence detection
+  win_threshold: 0.001     # More aggressive early stopping
+  
+  # Model architecture optimizations
+  hidden_dim_ratio: 0.6    # Smaller hidden layers for speed
+  dropout: 0.2             # Better regularization with fewer epochs
+  use_mixed_precision: true # Enable mixed precision training
+  
+  # Memory optimizations  
+  max_cache_size: 20       # Increase chunk cache for streaming
+  gradient_clip: 1.0       # Gradient clipping for stability
+  
   seed: 2
   text_path: 'C:/Users/DEVESH PALO/projects/Diagf/diagf/data/gaia/demo/demo_1100/anomalies/stratification_texts.pkl'
 
