@@ -19,7 +19,7 @@ py2neo==2021.2.4
 # Utils
 tqdm==4.65.0
 joblib==1.2.0
-networkx==2.8.
+networkx==2.8.0
 
 #other modules
 pyyaml==6.0

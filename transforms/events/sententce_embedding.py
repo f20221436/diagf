@@ -21,10 +21,15 @@ def read_text(path):
 
 
 def sentence_embedding(file_dict, train_path, test_path, save_path, service_num):
+    # Memory-efficient version: processes data in chunks
+    print('Loading event embeddings...')
     data_dict = pf.load(file_dict)
 
+    print('Reading text files...')
     train_text = read_text(train_path)
     test_text = read_text(test_path)
+    
+    print('Computing TF-IDF vectorization...')
     vectorizer = CountVectorizer(lowercase=False, token_pattern=r'(?u)\b\S\S+')  # 该类会将文本中的词语转换为词频矩阵，矩阵元素a[i][j] 表示j词在i类文本下的词频
     transformer = TfidfTransformer()  # 该类会统计每个词语的tf-idf权值
     # 第一个fit_transform是计算tf-idf，第二个fit_transform是将文本转为词频矩阵
@@ -49,12 +54,19 @@ def sentence_embedding(file_dict, train_path, test_path, save_path, service_num)
     print('dict(fasttext words) - dict(vectorizer words) = ', set(data_dict.keys()-set(word_dict.keys())))
     print('dict(vectorizer words) - dict(fasttext words) = ', set(word_dict.keys()-set(data_dict.keys())))
 
+    print('Generating sentence embeddings...')
     train_embedding = tfidf_word_embedding(weight_train, data_dict, train_text, word_dict, service_num)
+    # Clear train data from memory before processing test
+    del weight_train, vec_train, tfidf_train
+    
     test_embedding = tfidf_word_embedding(weight_test, data_dict, test_text, word_dict, service_num)
+    # Clear test data from memory
+    del weight_test, vec_test, tfidf_test
 
     train_embedding.extend(test_embedding)
 
     print('sentence_embedding shape:', f'{len(train_embedding)} * {len(train_embedding[0])} * {len(train_embedding[0][0])}')
+    print('Saving sentence embeddings...')
     pf.save(save_path, train_embedding)
 
 

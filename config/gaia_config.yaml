@@ -43,7 +43,7 @@ he_dgl:
   data_dir: ''
   save_dir: 'dgl/stratification_10'
   Xs: 'sentence_embedding.pkl'
-  run_table: 'gaia_resplit.csv' # 'demo_train160.csv'
+  run_table: 'gaia_resplit.csv'
   aug: False
   aug_size: 0
   N_S: 5 

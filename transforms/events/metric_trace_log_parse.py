@@ -7,11 +7,15 @@ from tqdm import tqdm
 
 
 def metric_trace_log_parse(trace, metric, logs, labels, save_path, nodes):
+    print('Processing metric, trace, and log data...')
+    
     if not metric is None: # 去除np.inf数值的指标
+        print('Cleaning metric data...')
         for k, v in metric.items():
             metric[k] = [x for x in v if not math.isinf(x[3])]
 
     if not logs is None:
+        print('Processing log data...')
         logs = list(logs)
         log = {x: [] for x in labels.index}
         if labels.index[-1]+1 == len(log):
@@ -32,7 +36,8 @@ def metric_trace_log_parse(trace, metric, logs, labels, save_path, nodes):
 #     demo_metric = {x: {} for x in metric.keys()}
     demo_metric = {x: {} for x in labels.index}
     k = 0
-    for case_id, v in tqdm(demo_metric.items()):
+    print(f'Parsing {len(demo_metric)} cases...')
+    for case_id, v in tqdm(demo_metric.items(), desc="Parsing events"):
         anomaly_service_name = anomaly_service[k]
         anomaly_service_type = anomaly_type[k]
         k += 1
@@ -60,6 +65,7 @@ def metric_trace_log_parse(trace, metric, logs, labels, save_path, nodes):
             temp_list = [x[1] for x in sort_list]
             demo_metric[case_id][inner_key] = ' '.join(temp_list)
 
+    print('Saving parsed data...')
     pf.save(save_path, demo_metric)
 
 

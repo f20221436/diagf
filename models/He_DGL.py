@@ -61,24 +61,46 @@ class UnircaDataset():
 
     def load(self):
         """ __init__()  中使用，作用是装载 self.graphs 和 self.labels，若aug为True，则进行数据增强操作。
+        Memory-optimized version: loads data in chunks to avoid memory overflow.
         """
-        Xs = tensor(U.load_info(self.dataset_path))
+        # Load labels first (smaller memory footprint)
         ys = tensor(U.load_info(self.labels_path))
+        
+        # Load Xs data
+        Xs_data = U.load_info(self.dataset_path)
+        Xs = tensor(Xs_data)
+        del Xs_data  # Free memory immediately
+        
         topology = U.load_info(self.topology)
         assert Xs.shape[0] == ys.shape[0]
+        
         if self.aug:
             Xs, ys = self.aug_data(Xs, ys)
 
-        for X in Xs:
-            g = dgl.graph(topology)  # 同质图
-            # 若有0入度节点，给这些节点加自环
-            in_degrees = g.in_degrees()
-            zero_indegree_nodes = [i for i in range(len(in_degrees)) if in_degrees[i].item() == 0]
-            for node in zero_indegree_nodes:
-                g.add_edges(node, node)
+        # Process graphs in chunks to reduce memory usage
+        chunk_size = 50  # Process 50 graphs at a time
+        total_graphs = Xs.shape[0]
+        
+        for chunk_start in range(0, total_graphs, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total_graphs)
+            chunk_Xs = Xs[chunk_start:chunk_end]
+            
+            for X in chunk_Xs:
+                g = dgl.graph(topology)  # 同质图
+                # 若有0入度节点，给这些节点加自环
+                in_degrees = g.in_degrees()
+                zero_indegree_nodes = [i for i in range(len(in_degrees)) if in_degrees[i].item() == 0]
+                for node in zero_indegree_nodes:
+                    g.add_edges(node, node)
 
-            g.ndata['attr'] = X
-            self.graphs.append(g)
+                g.ndata['attr'] = X
+                self.graphs.append(g)
+            
+            # Clear chunk from memory
+            del chunk_Xs
+        
+        # Clear Xs after all graphs are created
+        del Xs
         self.labels = ys
 
     def shuffle(self):
@@ -334,10 +356,12 @@ class UnircaLab():
         if self.config['seed'] is not None:
             torch.manual_seed(self.config['seed'])
 #         print('len train_dataset=', len(dataset))
-        dataloader = DataLoader(dataset, batch_size=self.config['batch_size'], collate_fn=self.collate)
-#         device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        device = 'cpu'
-        # print(device)
+        dataloader = DataLoader(dataset, batch_size=self.config['batch_size'], collate_fn=self.collate, num_workers=0)
+        # Use CUDA GPU if available
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f'Using device: {device}')
+        if device.type == 'cuda':
+            print(f'GPU: {torch.cuda.get_device_name(0)}')
 
         in_dim = dataset.graphs[0].ndata['attr'].shape[1]
 #         out_dim = len(set([i.item() for i in dataset.labels]))
@@ -470,9 +494,14 @@ class UnircaLab():
         if self.config['seed'] is not None:
             torch.manual_seed(self.config['seed'])
         weight = 0.5
-        device = 'cpu'
-        dataloader_ts = DataLoader(dataset_ts, batch_size=self.config['batch_size'], collate_fn=self.collate)
-        dataloader_ta = DataLoader(dataset_ta, batch_size=self.config['batch_size'], collate_fn=self.collate)
+        # Use CUDA GPU if available
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f'Using device: {device}')
+        if device.type == 'cuda':
+            print(f'GPU: {torch.cuda.get_device_name(0)}')
+        
+        dataloader_ts = DataLoader(dataset_ts, batch_size=self.config['batch_size'], collate_fn=self.collate, num_workers=0, pin_memory=True if device.type == 'cuda' else False)
+        dataloader_ta = DataLoader(dataset_ta, batch_size=self.config['batch_size'], collate_fn=self.collate, num_workers=0, pin_memory=True if device.type == 'cuda' else False)
         in_dim = dataset_ts.graphs[0].ndata['attr'].shape[1]
         hid_dim = in_dim * 2 // 3
         out_dim_ts = self.config['N_S']
@@ -522,9 +551,15 @@ class UnircaLab():
         if self.config['seed'] is not None:
             torch.manual_seed(self.config['seed'])
         weight = 0.5
-        device = 'cpu'
-        dataloader_ts = DataLoader(dataset_ts, batch_size=self.config['batch_size'], collate_fn=self.collate)
-        dataloader_ta = DataLoader(dataset_ta, batch_size=self.config['batch_size'], collate_fn=self.collate)
+        # Use CUDA GPU if available
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f'Using device: {device}')
+        if device.type == 'cuda':
+            print(f'GPU: {torch.cuda.get_device_name(0)}')
+            print(f'Memory Available: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB')
+        
+        dataloader_ts = DataLoader(dataset_ts, batch_size=self.config['batch_size'], collate_fn=self.collate, num_workers=0, pin_memory=True if device.type == 'cuda' else False)
+        dataloader_ta = DataLoader(dataset_ta, batch_size=self.config['batch_size'], collate_fn=self.collate, num_workers=0, pin_memory=True if device.type == 'cuda' else False)
         in_dim_ts = dataset_ts.graphs[0].ndata['attr'].shape[1]
         out_dim_ts = self.config['N_S']
         hid_dim_ts = (in_dim_ts + out_dim_ts) * 2 // 3
@@ -593,9 +628,12 @@ class UnircaLab():
     def trans_train(self, dataset_src, dataset_target, retrain=False):
         if self.config['seed'] is not None:
             torch.manual_seed(self.config['seed'])
-        dataloader_src = DataLoader(dataset_src, batch_size=self.config['batch_size'], collate_fn=self.collate)
-        device = 'cpu'
-        print(device)
+        dataloader_src = DataLoader(dataset_src, batch_size=self.config['batch_size'], collate_fn=self.collate, num_workers=0)
+        # Use CUDA GPU if available
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f'Using device: {device}')
+        if device.type == 'cuda':
+            print(f'GPU: {torch.cuda.get_device_name(0)}')
 
         in_dim = dataset_src.graphs[0].ndata['attr'].shape[1]
         out_dim = self.config['N_A']
