@@ -1,238 +1,212 @@
+#!/usr/bin/env python3
 """
-Test Metric Processing Script
-==============================
-Tests the EXACT same metric processing logic on first 5 files.
-Uses identical code from preprocess_gaia_raw.py
+discover_anomalies.py
+
+Reads run_table_*.csv files from <raw-path>/run and prints ONLY the unique anomaly types
+detected across all messages.
 """
+
+import re
+import argparse
+from pathlib import Path
 
 import pandas as pd
-import numpy as np
-import json
-from pathlib import Path
-from multiprocessing import Pool
 from tqdm import tqdm
-import sys
-import gc
 
-# Add parent directory to path to import modules
-sys.path.insert(0, str(Path(__file__).parent))
+# --------------------
+# Normalization helpers
+# --------------------
+_ts_prefix_re = re.compile(r'^\s*\d{4}-\d{2}-\d{2}.*?\|\s*')  # trims leading timestamp + header up to '|'
+_ip_re = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+_uuid_re = re.compile(r'\b[0-9a-f]{8,}\b', re.I)
+_date_re = re.compile(r'\b\d{4}-\d{2}-\d{2}\b')
+_time_re = re.compile(r'\b\d{2}:\d{2}:\d{2}(?:,\d+)?\b')
+_number_re = re.compile(r'\b\d+\b')
 
-from detector.k_sigma import Ksigma
+def _take_message_field(msg: str) -> str:
+    """Many logs are pipe-separated; assume the human-readable message is the last field."""
+    if '|' in msg:
+        return msg.split('|')[-1].strip()
+    return msg.strip()
 
+def _normalize_for_search(msg: str) -> str:
+    """
+    Lowercase copy suitable for keyword regex searching.
+    Keep underscores and hyphens (they are meaningful), but replace IP/IDs/dates/numbers to reduce noise.
+    """
+    s = msg.strip()
+    s = _ts_prefix_re.sub('', s)          # remove leading timestamp/header
+    s = _take_message_field(s)            # take last pipe-separated field
+    # replace noisy tokens (preserve underscores/hyphens)
+    s = _ip_re.sub('<IP>', s)
+    s = _uuid_re.sub('<ID>', s)
+    s = _date_re.sub('<DATE>', s)
+    s = _time_re.sub('<TIME>', s)
+    s = _number_re.sub('<NUM>', s)
+    s = re.sub(r'\s+', ' ', s).strip().lower()
+    return s
 
-def process_metric_data_parallel(args):
-    """Process single metric file (for parallel execution) - EXACT COPY from main script"""
-    metric_file, time_windows = args
-    
-    case_metrics = {case_id: [] for case_id, _, _ in time_windows}
-    
-    try:
-        # Read entire metric file
-        df = pd.read_csv(metric_file)
-        
-        # Convert timestamp to numeric if needed
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
-        
-        # NO SAMPLING - process entire file
-        sampled = df
-        
-        # Apply K-sigma anomaly detection
-        ksigma = Ksigma()
-        
-        for case_id, st_ts, ed_ts in time_windows:
-            # Filter metrics in time window (vectorized - fast)
-            mask = (sampled['timestamp'] >= st_ts) & (sampled['timestamp'] < ed_ts)
-            case_data = sampled[mask]
-            
-            if len(case_data) == 0:
-                continue
-            
-            # Extract metric anomalies
-            for col in case_data.columns:
-                if col in ['timestamp', 'service']:
-                    continue
-                
-                try:
-                    is_anomaly, anomaly_ts, score = ksigma.detection(
-                        case_data, col, int(st_ts), int(ed_ts)
-                    )
-                    
-                    if is_anomaly:
-                        service = metric_file.stem.split('_')[0] if '_' in metric_file.stem else 'unknown'
-                        # Convert numpy types to Python native types for JSON serialization
-                        case_metrics[case_id].append([
-                            int(anomaly_ts),      # numpy.int64 -> Python int
-                            str(service),         # Ensure string
-                            str(col),             # Ensure string
-                            float(score)          # numpy.float64 -> Python float
-                        ])
-                except:
-                    pass
-        
-        del df, sampled
-        gc.collect()
-    
-    except Exception as e:
-        print(f"Error processing {metric_file.name}: {e}")
-    
-    return case_metrics
+# --------------------
+# Ordered anomaly patterns (priority matters)
+# --------------------
+ANOMALY_PATTERNS = [
+    (re.compile(r'\bpod[-_\s]?failure\b', re.I), 'pod_failure'),
+    (re.compile(r'\bnode[-_\s]?failure\b', re.I), 'node_failure'),
+    (re.compile(r'\bnetwork[-_\s]?delay\b', re.I), 'network_delay'),
+    (re.compile(r'\bnetwork[-_\s]?loss\b', re.I), 'network_loss'),
+    (re.compile(r'\bpacket[-_\s]?loss\b', re.I), 'network_loss'),
+    (re.compile(r'\blogin[-_\s]?failure\b', re.I), 'login_failure'),
+    (re.compile(r'\bauthentication failed\b|\bauth failed\b|\binvalid credentials\b|\bfailed to authenticate\b', re.I), 'login_failure'),
+    (re.compile(r'\bcpu[-_\s]?load\b|\bhigh cpu\b', re.I), 'cpu_load'),
+    (re.compile(r'\bmem(?:ory)?[-_\s]?load\b|\bmemory pressure\b', re.I), 'mem_load'),
+    (re.compile(r'\btimeout\b|\btimed out\b', re.I), 'timeout'),
+    (re.compile(r'\berror\b|\bexception\b', re.I), 'error'),
+    (re.compile(r'\bfailure\b', re.I), 'failure'),
+]
 
+BRACKET_RE = re.compile(r'\[([^\]]+)\]')
 
-def test_metric_processing():
-    """Test metric processing on first 5 files - EXACT COPY from main script"""
-    print("="*80)
-    print("METRIC PROCESSING TEST (First 5 Files)")
-    print("="*80)
-    
-    # Paths - same as main script
-    raw_path = Path(r'C:\Users\DEVESH PALO\projects\GAIA-DataSet-main\GAIA-DataSet-main\GAIA-DataSet-main\MicroSS')
-    output_path = raw_path / 'anomalies'
-    output_path.mkdir(exist_ok=True)
-    
-    # Load run table - EXACT COPY from main script
-    print("\n[1/4] Loading run table...")
-    run_files = list(raw_path.glob('run/run_table_*.csv'))
-    run_dfs = []
+def _detect_from_bracket_content(content: str):
+    """
+    Given a bracket content like "pod_failure_id_011e_11ec_ad8a_docker001" or "id_f23d_11eb_b91a",
+    try to extract a known anomaly prefix (pod_failure, node_failure, network_delay...).
+    If a known keyword is found inside the bracket content, return its canonical name;
+    additionally treat short id-like tokens (id_xxx_yyy) as pod_failure heuristically.
+    """
+    s = content.strip().lower()
+
+    # 1) If a known anomaly keyword appears inside the bracket content, return it.
+    for pat, canonical in ANOMALY_PATTERNS:
+        if pat.search(s):
+            return canonical
+
+    # 2) Heuristic: if bracket content is an id-like token such as "id_f23d_11eb_b91a"
+    #    or contains an "_id_" suffix with hex-like segments, consider it a pod_failure.
+    #    This covers cases where the log stores only the unique id and we should infer pod failure.
+    if re.search(r'\bid_[0-9a-f]{3,}(_[0-9a-f]{2,})+\b', s) or re.match(r'^id_[0-9a-f_]+$', s):
+        return 'pod_failure'
+
+    # 3) If the bracket looks like a short anomaly name (no long uuid-like parts), return cleaned:
+    if len(s) <= 40 and re.search(r'[a-z]', s) and not re.search(r'[a-f0-9]{12,}', s):
+        cleaned = re.sub(r'[\s\-]+', '_', s)
+        cleaned = re.sub(r'_id_.*$', '', cleaned)  # drop trailing _id_...
+        return cleaned
+
+    return None
+
+def extract_anomaly_type(raw_message: str):
+    """
+    Return a canonical anomaly type (string) if detected, else None.
+    Order:
+      1) Look for specific anomaly keyword patterns (ordered)
+      2) Look for quoted tokens containing anomaly keywords (e.g., "pod-failure")
+      3) As LAST RESORT, check bracketed tokens and try to extract anomaly name from them
+      4) If nothing found, return None (we only want to show anomalies)
+    """
+    if not isinstance(raw_message, str):
+        return None
+
+    normalized = _normalize_for_search(raw_message)
+
+    # 1) Check specific keyword patterns (highest priority)
+    for pat, canonical in ANOMALY_PATTERNS:
+        if pat.search(normalized):
+            return canonical
+
+    # 2) Check quoted tokens: e.g., "... simulate \"pod-failure\" anomaly ..."
+    quoted = re.findall(r'"([^"]+)"', normalized)
+    for q in quoted:
+        for pat, canonical in ANOMALY_PATTERNS:
+            if pat.search(q):
+                return canonical
+        if re.match(r'^[a-z0-9_\-]+[-_]?failure$', q) or re.match(r'^[a-z0-9_\-]+[-_]?delay$', q) or re.match(r'^[a-z0-9_\-]+[-_]?loss$', q):
+            return q.replace('-', '_')
+
+    # 3) LAST RESORT: bracket tokens (only if they contain anomaly-like text or id-like token)
+    bracket_matches = BRACKET_RE.findall(raw_message)
+    for b in bracket_matches:
+        candidate = _detect_from_bracket_content(b)
+        if candidate:
+            return candidate
+
+    # Nothing matched => not an anomaly we care about
+    return None
+
+# --------------------
+# Main CLI and flow
+# --------------------
+def main():
+    parser = argparse.ArgumentParser(description='Discover anomaly types from GAIA run_table_*.csv files (only anomalies).')
+    parser.add_argument(
+        '--raw-path',
+        type=str,
+        default=r'C:\Users\DEVESH PALO\projects\GAIA-DataSet-main\GAIA-DataSet-main\GAIA-DataSet-main\MicroSS',
+        help='Path to MicroSS directory (where the /run folder is)'
+    )
+    args = parser.parse_args()
+
+    raw_path = Path(args.raw_path)
+    run_folder = raw_path / 'run'
+
+    if not run_folder.exists():
+        print(f"Error: run folder not found at: {run_folder}")
+        return
+
+    run_files = sorted(run_folder.glob('run_table_*.csv'))
+    if not run_files:
+        print(f"Error: No run_table_*.csv files found in {run_folder}")
+        return
+
+    print(f"Scanning {len(run_files)} files in {run_folder}...\n")
+
+    all_dfs = []
     for f in run_files:
-        df = pd.read_csv(f)
-        run_dfs.append(df)
-    
-    run_table = pd.concat(run_dfs, ignore_index=True)
-    
-    if 'case_id' not in run_table.columns:
-        run_table['case_id'] = range(len(run_table))
-    
-    run_table['st_time'] = pd.to_datetime(run_table['datetime'])
-    run_table['ed_time'] = run_table['st_time'] + pd.to_timedelta(5, unit='m')
-    
-    print(f"  Cases loaded: {len(run_table)}")
-    
-    # Prepare time windows - EXACT COPY from main script
-    print("\n[2/4] Preparing time windows...")
-    time_windows = []
-    for idx, case in run_table.iterrows():
-        st_ts = pd.Timestamp(case['st_time']).timestamp() * 1000
-        ed_ts = pd.Timestamp(case['ed_time']).timestamp() * 1000
-        time_windows.append((case['case_id'], st_ts, ed_ts))
-    
-    print(f"  Time windows: {len(time_windows)}")
-    
-    # Get metric files - EXACT COPY from main script
-    print("\n[3/4] Finding metric files...")
-    metric_files = list(raw_path.glob('metric/metric_split/metric/*.csv'))
-    print(f"  Total metric files: {len(metric_files)}")
-    
-    # Test on first 5 files only
-    test_files = metric_files[:5]
-    print(f"\n  Testing on first {len(test_files)} files:")
-    for f in test_files:
-        print(f"    - {f.name}")
-    
-    # Prepare arguments - EXACT COPY from main script
-    args_list = [(f, time_windows) for f in test_files]
-    
-    # Process in parallel - EXACT COPY from main script
-    print("\n[4/4] Processing metric files with 2 workers...")
-    with Pool(processes=2) as pool:
-        results = list(tqdm(
-            pool.imap(process_metric_data_parallel, args_list),
-            total=len(args_list),
-            desc="Processing metric files"
-        ))
-    
-    # Merge results - EXACT COPY from main script
-    print("\n" + "="*80)
-    print("MERGING RESULTS")
-    print("="*80)
-    
-    metric_dict = {i: [] for i in range(len(run_table))}
-    for result in results:
-        for case_id, metrics in result.items():
-            metric_dict[case_id].extend(metrics)
-    
-    # Convert all keys to Python int - EXACT COPY from main script
-    metric_dict = {int(k): v for k, v in metric_dict.items()}
-    
-    total_metrics = sum(len(v) for v in metric_dict.values())
-    cases_with_metrics = sum(1 for v in metric_dict.values() if len(v) > 0)
-    
-    print(f"  Total cases: {len(metric_dict)}")
-    print(f"  Cases with metrics: {cases_with_metrics}")
-    print(f"  Total anomalies: {total_metrics}")
-    if cases_with_metrics > 0:
-        print(f"  Avg anomalies per case: {total_metrics/cases_with_metrics:.1f}")
-    
-    # Save metric JSON - EXACT COPY from main script
-    print("\n" + "="*80)
-    print("SAVING JSON")
-    print("="*80)
-    
-    output_file = output_path / 'test_metric.json'
-    
-    try:
-        print("  Writing to JSON...")
-        with open(output_file, 'w') as f:
-            json.dump(metric_dict, f)
-        
-        file_size_kb = output_file.stat().st_size / 1024
-        print(f"  ✓ JSON saved successfully!")
-        print(f"  File: {output_file}")
-        print(f"  Size: {file_size_kb:.2f} KB")
-        
-        # Verify by reading back
-        print("\n  Verifying saved file...")
-        with open(output_file, 'r') as f:
-            loaded_dict = json.load(f)
-        
-        print(f"  ✓ File loaded successfully!")
-        print(f"  Loaded cases: {len(loaded_dict)}")
-        print(f"  Loaded anomalies: {sum(len(v) for v in loaded_dict.values())}")
-        
-        # Check sample entry if available
-        if total_metrics > 0:
-            sample_case = next((k for k, v in loaded_dict.items() if len(v) > 0), None)
-            if sample_case:
-                sample_anomaly = loaded_dict[str(sample_case)][0]  # JSON converts keys to strings
-                print(f"\n  Sample anomaly from case {sample_case}:")
-                print(f"    {sample_anomaly}")
-                print(f"    Types: {[type(x).__name__ for x in sample_anomaly]}")
-                
-                # Check for numpy types
-                has_numpy = any('numpy' in str(type(x).__module__) for x in sample_anomaly)
-                if has_numpy:
-                    print(f"  [ERROR] Numpy types detected!")
-                    return False
-                else:
-                    print(f"  ✓ All types are Python native!")
-        
-        print("\n" + "="*80)
-        print("TEST PASSED! ✓")
-        print("="*80)
-        print("\nThe metric processing works correctly:")
-        print("  ✓ Files processed successfully")
-        print(f"  ✓ {total_metrics} anomalies detected")
-        print("  ✓ JSON serialization successful")
-        print("  ✓ No numpy type errors")
-        print("\nYou can now run the full preprocessing!")
-        
-        return True
-        
-    except TypeError as e:
-        print(f"  [ERROR] JSON serialization failed!")
-        print(f"  Error: {e}")
-        print("\n  This means numpy types are still present in the data.")
-        import traceback
-        traceback.print_exc()
-        return False
-    
-    except Exception as e:
-        print(f"  [ERROR] Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        print(f" - Reading {f.name} ...")
+        try:
+            df = pd.read_csv(f)
+        except Exception as e:
+            print(f"   Skipping {f.name} due to read error: {e}")
+            continue
+        if 'message' not in df.columns:
+            print(f"   Warning: {f.name} has no 'message' column — skipping")
+            continue
+        all_dfs.append(df[['message']])
+        print(f"   Loaded {len(df)} rows")
 
+    if not all_dfs:
+        print("No valid data to process.")
+        return
+
+    run_table = pd.concat(all_dfs, ignore_index=True)
+    print(f"\nTotal log messages to scan: {len(run_table)}")
+
+    # collect only anomaly types
+    found_types = set()
+    example_map = {}
+
+    print("\nDetecting anomaly types (only anomalies will be reported)...")
+    for msg in tqdm(run_table['message'].astype(str), desc='Scanning messages'):
+        a = extract_anomaly_type(msg)
+        if a:
+            found_types.add(a)
+            if a not in example_map:
+                example_map[a] = msg
+
+    if not found_types:
+        print("\nNo anomalies found by the configured detectors.")
+        return
+
+    print("\n" + "="*50)
+    print(" DETECTED ANOMALY TYPES (canonical names)")
+    print("="*50)
+    for t in sorted(found_types):
+        print(f"- {t}")
+    print("\n(Only anomaly types are printed. Non-anomalous messages are ignored.)")
+
+    print("\nExamples (first message that produced each anomaly type):")
+    for t in sorted(found_types):
+        print(f"\n--- {t} ---")
+        print(example_map[t])
 
 if __name__ == '__main__':
-    success = test_metric_processing()
-    sys.exit(0 if success else 1)
+    main()

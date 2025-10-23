@@ -14,18 +14,26 @@ parse:
 fasttext:
   supervised: True
   dataset: 'gaia'
-  nodes: 'dbservice1 dbservice2 logservice1 logservice2 mobservice1 mobservice2 redisservice1 redisservice2 webservice1 webservice2'
-  text_path: 'parse/stratification_texts.pkl'
-  fasttext_dir: 'fasttext'
-  temp_dir: 'fasttext/temp'
-  train_path: 'fasttext/temp/train.txt'
-  test_path: 'fasttext/temp/test.txt'
-  train_da_path: 'fasttext/temp/train_da.txt'
-  save_path: 'fasttext/event_embedding.pkl'
+  nodes: 'dbservice1 dbservice2 logservice1 logservice2 mobservice1 mobservice2 redisservice1 redisservice2 webservice1 webservice2' # Keep your node list
+
+  # --- Input Files (Relative Paths from 'diagf' directory) ---
+  # Go up two levels, then down into the GAIA-DataSet project structure
+  fasttext:
+  # ... other keys ...
+
+  # --- Use Absolute Paths ---
+  text_path: "C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/anomalies/metric_trace_text.pkl"
+  labels_path: "C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/gaia_resplit.csv"
+  save_path: "C:/Users/DEVESH PALO/projects/DiagFusionWorking/diagf/fasttext/event_embedding.pkl"
+  train_path: "C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/anomalies/fasttext_temp/train.txt"
+  test_path: "C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/anomalies/fasttext_temp/test.txt"
+  train_da_path: "C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/anomalies/fasttext_temp/train_da.txt"
+
+  # --- Model Parameters (Keep these as they were) ---
   vector_dim: 100
-  sample_count: 1000
-  edit_count: 1
-  da_method: 'w2v'
+  sample_count: 1000 # Used for Data Augmentation (DA)
+  edit_count: 1     # Used for Data Augmentation (DA)
+  da_method: 'w2v'  # Keep if you are using the DA method
   minCount: 1
   epoch: 5
 
@@ -37,27 +45,58 @@ sentence_embedding:
   save_path: 'sentence_embedding.pkl'
 
 he_dgl:
-  nodes: 'dbservice1 dbservice2 logservice1 logservice2 mobservice1 mobservice2 redisservice1 redisservice2 webservice1 webservice2'
-  dataset: 'gaia'
+  # --- CRITICAL PATHS ---
+  # 1. ADD THIS LINE: Path to the main data directory
+  data_dir: "C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS"
+
+  # 2. Path to the BASE of your sentence embedding chunks
+  Xs: "C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/anomalies/sentence_embedding" 
+
+  # 3. Path to your run_table file (relative to data_dir, or absolute)
+  #    Using just the filename is fine if it's directly inside data_dir
+  run_table: "C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/gaia_resplit.csv" 
+  #  Alternatively, you could keep the absolute path here too:
+  #  run_table: "C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/gaia_resplit.csv"
+
+  # 4. Directory to SAVE intermediate files (labels, topology) for DGL
+  save_dir: "C:/Users/DEVESH PALO/projects/DiagFusionWorking/diagf/dgl_processed_data" 
+
+  # --- Paths USED by the DGL Dataset loader ---
+  #    These point to files CREATED by the RawDataProcess step within save_dir
+  topology: "C:/Users/DEVESH PALO/projects/DiagFusionWorking/diagf/dgl_processed_data/topology.pkl"
+  train_ys_service: "C:/Users/DEVESH PALO/projects/DiagFusionWorking/diagf/dgl_processed_data/train_ys_service.pkl"
+  train_ys_anomaly_type: "C:/Users/DEVESH PALO/projects/DiagFusionWorking/diagf/dgl_processed_data/train_ys_anomaly_type.pkl"
+  test_ys_service: "C:/Users/DEVESH PALO/projects/DiagFusionWorking/diagf/dgl_processed_data/test_ys_service.pkl"
+  test_ys_anomaly_type: "C:/Users/DEVESH PALO/projects/DiagFusionWorking/diagf/dgl_processed_data/test_ys_anomaly_type.pkl"
+  
+  text_path: "C:/Users/DEVESH PALO/projects/GAIA-DataSet-main/GAIA-DataSet-main/GAIA-DataSet-main/MicroSS/anomalies/metric_trace_text.pkl"
+  # --- Model & Training Parameters (Keep or adjust as needed) ---
+  dataset: 'gaia' 
+  nodes: 'dbservice1 dbservice2 logservice1 logservice2 mobservice1 mobservice2 redisservice1 redisservice2 webservice1 webservice2' 
   heterogeneous: False 
-  data_dir: ''
-  save_dir: 'dgl/stratification_10'
-  Xs: 'sentence_embedding.pkl'
-  run_table: 'gaia_resplit.csv'
-  aug: False
-  aug_size: 0
-  N_S: 5 
-  N_A: 5
-  TOPK_SA: 10
-  save_model: False
-  epoch: 6000 
-  batch_size: 1000 
-  win_size: 10
-  win_threshold: 0.0001
+  N_S: 10            
+  N_A: 8             # Assuming only '[normal]' was found
+  
+  # Training Hyperparameters
+  seed: 42
+  batch_size: 64    
   lr: 0.001
   weight_decay: 0.0001
-  seed: 2
-  text_path: 'parse/stratification_texts.pkl'
+  epoch: 5         
+  win_size: 50       
+  win_threshold: 0.0001 
+  aug: False         
+  aug_size: 0
+  save_model: True   
+
+  # Performance Optimizations (Keep these)
+  use_mixed_precision: True
+  gradient_clip: 1.0
+  num_workers: 0     
+  pin_memory: True
+  prefetch_factor: 4
+  persistent_workers: True
+  hidden_dim_ratio: 0.6
 
 source_data_path: 'data/gaia/source_data'
 event_path: 'data/gaia/events'

@@ -28,6 +28,7 @@ from multiprocessing import Pool, cpu_count
 from datetime import datetime
 import time
 import gc
+import re
 
 # Import DiagFusion modules
 from detector.k_sigma import Ksigma
@@ -35,13 +36,14 @@ from detector.k_sigma import Ksigma
 # Import Drain log parser
 try:
     from log.logparser.logparser.Drain.Drain import LogParser as DrainParser
-except ImportError:
+except ImportError as e:
+    print(f"\n[DEBUG] The real import error is: {e}\n")
     print("[WARNING] Drain log parser not available. Will use raw log messages.")
     DrainParser = None
 
 
 class GAIAPreprocessor:
-    def __init__(self, raw_data_path, output_path, n_workers=2, metric_sample_rate=0.3):
+    def __init__(self, raw_data_path, output_path, n_workers=2, metric_sample_rate=1):
         """
         Initialize GAIA preprocessor
         
@@ -49,7 +51,7 @@ class GAIAPreprocessor:
             raw_data_path: Path to MicroSS directory
             output_path: Path to save preprocessed data
             n_workers: Number of CPU cores to use (2-4)
-            metric_sample_rate: Sampling rate for metric/business data (0.3 = 30%)
+            metric_sample_rate: Sampling rate for metric/business data (1 = 100%)
         """
         self.raw_path = Path(raw_data_path)
         self.output_path = Path(output_path)
@@ -107,13 +109,136 @@ class GAIAPreprocessor:
                 print(f"[Warning] Missing column: {col}")
         
         # Add time window columns (5-minute window after fault injection)
+        
+
+        BRACKET_RE = re.compile(r'\[([^\]]+)\]')
+
+        # Ordered patterns (highest priority first). Add more patterns here as needed.
+        ANOMALY_PATTERNS = [
+            (re.compile(r'\bpod[-_\s]?failure\b|\bpodfailure\b', re.I), 'pod_failure'),
+            (re.compile(r'\bnode[-_\s]?failure\b|\bnodfailure\b', re.I), 'node_failure'),
+            (re.compile(r'\bnetwork[-_\s]?delay\b', re.I), 'network_delay'),
+            (re.compile(r'\bnetwork[-_\s]?loss\b|\bpacket[-_\s]?loss\b', re.I), 'network_loss'),
+            (re.compile(r'\blogin[-_\s]?failure\b', re.I), 'login_failure'),
+            (re.compile(r'\bauthentication failed\b|\bauth failed\b|\binvalid credentials\b|\bfailed to authenticate\b', re.I), 'login_failure'),
+            (re.compile(r'\bcpu[-_\s]?load\b|\bhigh cpu\b|\bcpu anomalies?\b', re.I), 'cpu_load'),
+            (re.compile(r'\bmem(?:ory)?[-_\s]?load\b|\bmemory pressure\b|\bmemory anomalies?\b', re.I), 'mem_load'),
+            (re.compile(r'\btimeout\b|\btimed out\b', re.I), 'timeout'),
+            (re.compile(r'\berror\b|\bexception\b', re.I), 'error'),
+            (re.compile(r'\bfailure\b', re.I), 'failure'),
+        ]
+
+        # Helper: get the "human" message (last pipe-separated field if present)
+        def _take_message_field(msg: str) -> str:
+            if not isinstance(msg, str):
+                return ''
+            if '|' in msg:
+                return msg.split('|')[-1].strip()
+            return msg.strip()
+
+        # Helper: normalized text for keyword searching (lowercased, noisy tokens removed)
+        _ip_re = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+        _uuid_re = re.compile(r'\b[0-9a-f]{8,}\b', re.I)
+        _date_re = re.compile(r'\b\d{4}-\d{2}-\d{2}\b')
+        _time_re = re.compile(r'\b\d{2}:\d{2}:\d{2}(?:,\d+)?\b')
+        _number_re = re.compile(r'\b\d+\b')
+        _ts_prefix_re = re.compile(r'^\s*\d{4}-\d{2}-\d{2}.*?\|\s*')
+
+        def _normalize_for_search(msg: str) -> str:
+            s = str(msg or '')
+            s = _ts_prefix_re.sub('', s)            # drop leading date/header before '|'
+            s = _take_message_field(s)              # take last pipe-separated field (human text)
+            s = _ip_re.sub('<IP>', s)
+            s = _uuid_re.sub('<ID>', s)
+            s = _date_re.sub('<DATE>', s)
+            s = _time_re.sub('<TIME>', s)
+            s = _number_re.sub('<NUM>', s)
+            s = re.sub(r'\s+', ' ', s).strip().lower()
+            return s
+
+        def _detect_from_bracket_content(content: str):
+            """
+            Inspect bracket content like "pod_failure_id_011e_..." or "id_f23d_11eb_b91a".
+            Return canonical anomaly name if it can be inferred, else None.
+            """
+            s = (content or '').strip().lower()
+
+            # 1) Look for known anomaly keywords inside bracket content
+            for pat, canonical in ANOMALY_PATTERNS:
+                if pat.search(s):
+                    return canonical
+
+            # 2) Heuristic: id_... patterns (e.g. id_f23d_11eb_b91a or ..._id_011e_11ec...) => pod_failure
+            if re.search(r'\bid_[0-9a-f]{3,}(_[0-9a-f]{2,})+\b', s) or re.match(r'^id_[0-9a-f_]+$', s):
+                return 'pod_failure'
+
+            # 3) If bracket content looks short and readable (no long uuids), treat as cleaned anomaly token
+            if len(s) <= 40 and re.search(r'[a-z]', s) and not re.search(r'[a-f0-9]{12,}', s):
+                cleaned = re.sub(r'[\s\-]+', '_', s)
+                cleaned = re.sub(r'_id_.*$', '', cleaned)
+                # only return if looks like an anomaly-like token (contains letters)
+                if re.search(r'[a-z]', cleaned):
+                    return cleaned
+
+            return None
+
+        def find_anomaly_type(message):
+            """
+            Extract canonical anomaly type from a single log message.
+            Returns a string like 'pod_failure', 'network_delay', etc., or None if no anomaly found.
+            """
+            if not isinstance(message, str):
+                return None
+
+            normalized = _normalize_for_search(message)
+
+            # 1) Specific keyword patterns (highest priority)
+            for pat, canonical in ANOMALY_PATTERNS:
+                if pat.search(normalized):
+                    return canonical
+
+            # 2) Quoted tokens (e.g., "pod-failure", 'pod_failure') — check them for known patterns
+            quoted = re.findall(r'["\']([^"\']+)["\']', normalized)
+            for q in quoted:
+                for pat, canonical in ANOMALY_PATTERNS:
+                    if pat.search(q):
+                        return canonical
+                # some quoted tokens may be exact anomaly names (pod-failure / network-delay)
+                if re.match(r'^[a-z0-9_\-]+[-_]?failure$', q) or re.match(r'^[a-z0-9_\-]+[-_]?delay$', q) or re.match(r'^[a-z0-9_\-]+[-_]?loss$', q):
+                    return q.replace('-', '_')
+
+            # 3) id_ anywhere (explicit request): treat id_... as pod_failure
+            #    This catches both bracketed and non-bracketed id_ tokens like id_f23d_11eb_b91a
+            if re.search(r'\bid_[0-9a-f]{3,}(_[0-9a-f]{2,})*\b', normalized):
+                return 'pod_failure'
+
+            # 4) Bracketed content as LAST RESORT (only accept if it yields anomaly-like content)
+            bracket_matches = BRACKET_RE.findall(message)
+            for b in bracket_matches:
+                candidate = _detect_from_bracket_content(b)
+                if candidate:
+                    return candidate
+
+            # 5) Extra fallback for explicit simulate phrases (rare)
+            if re.search(r'simulate.*pod[-_\s]?failure', normalized):
+                return 'pod_failure'
+            if re.search(r'simulate.*node[-_\s]?failure', normalized):
+                return 'node_failure'
+
+            # No anomaly detected
+            return None
+        # ------------------------------------------------------------------
+
+        gaia_resplit['anomaly_type'] = gaia_resplit['message'].apply(find_anomaly_type)
+        
         gaia_resplit['st_time'] = pd.to_datetime(gaia_resplit['datetime'])
         gaia_resplit['ed_time'] = gaia_resplit['st_time'] + pd.to_timedelta(5, unit='m')
         
         # Extract anomaly type from message
-        gaia_resplit['anomaly_type'] = gaia_resplit['message'].str.extract(r'(pod-failure|node-failure|network-delay|network-loss|cpu-load|mem-load)')
+              
         gaia_resplit['instance'] = gaia_resplit['service']
         gaia_resplit['data_type'] = 'fault'
+        
         
         # Save gaia_resplit.csv
         output_file = self.output_path / 'gaia_resplit.csv'
@@ -358,89 +483,124 @@ class GAIAPreprocessor:
         return trace_dict
     
     def process_metric_data_parallel(self, args):
-        """Process single metric file (for parallel execution)"""
-        metric_file, time_windows = args
-        #print(f"[Worker] Starting to process: {metric_file.name}", flush=True)
-        case_metrics = {case_id: [] for case_id, _, _ in time_windows}
+        """
+        Truly vectorized version. Processes the file once and uses an efficient merge 
+        to map data to the correct time windows.
+        """
+        metric_file, time_windows_list, temp_dir = args
+        
+        pid = os.getpid()
+        timestamp = int(time.time() * 1000)
+        temp_output_path = temp_dir / f"metric_result_{pid}_{timestamp}.json"
         
         try:
-            # Read entire metric file
-            df = pd.read_csv(metric_file)
+            # 1. Prepare the time windows DataFrame for efficient merging
+            time_windows_df = pd.DataFrame(time_windows_list, columns=['case_id', 'st_time', 'ed_time'])
             
-            # Convert timestamp to numeric if needed
+            # === FIX: Ensure timestamp data types match ===
+            # Convert the float timestamps to integers to match the metric file's timestamp type
+            time_windows_df['st_time'] = time_windows_df['st_time'].astype('int64')
+            time_windows_df['ed_time'] = time_windows_df['ed_time'].astype('int64')
+            # ===============================================
+            
+            time_windows_df = time_windows_df.sort_values('st_time')
+
+            # 2. Read and prepare the metric data file
+            df = pd.read_csv(metric_file)
             if 'timestamp' in df.columns:
                 df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
-                df.dropna(inplace=True)
+            df.dropna(inplace=True)
+            if df.empty:
+                return None
             
-            # NO SAMPLING - process entire file
-            sampled = df
+            # 3. Melt the DataFrame ONCE to get a long format
+            id_vars = ['timestamp']
+            value_vars = [col for col in df.columns if col not in ['timestamp', 'service']]
+            if not value_vars:
+                return None
             
-            # Apply K-sigma anomaly detection
-            ksigma = Ksigma()
-            
-            for case_id, st_ts, ed_ts in time_windows:
-                # Filter metrics in time window (vectorized - fast)
-                mask = (sampled['timestamp'] >= st_ts) & (sampled['timestamp'] < ed_ts)
-                case_data = sampled[mask]
-                
-                if len(case_data) == 0:
-                    continue
-                
-                # Extract metric anomalies
-                # ADD THIS NEW BLOCK IN ITS PLACE
-                service = metric_file.stem.split('_')[0] if '_' in metric_file.stem else 'unknown'
+            long_df = pd.melt(df, id_vars=id_vars, value_vars=value_vars,
+                              var_name='metric_name', value_name='metric_value')
+            long_df = long_df.sort_values('timestamp')
 
-                for col in case_data.columns:
-                    if col in ['timestamp', 'service']:
-                        continue
-                    
-                    # First, detect if an anomaly exists in this window for this metric
-                    is_anomaly_present, anomaly_ts, score = ksigma.detection(
-                        case_data, col, int(st_ts), int(ed_ts)
-                    )
-                    
-                    # Now, iterate through EVERY data point in the window for this metric
-                    for index, row in case_data.iterrows():
-                        timestamp = row['timestamp']
-                        metric_value = row[col]
-                        
-                        # Label the data point: 1 if it's the anomaly, 0 otherwise
-                        is_anomaly_label = 1 if (is_anomaly_present and timestamp == anomaly_ts) else 0
-                        
-                        # Append the labeled data point
-                        case_metrics[case_id].append([
-                            int(timestamp),
-                            str(service),
-                            str(col),             # The metric name (e.g., 'cpu_usage')
-                            float(metric_value),  # The actual value of the metric
-                            is_anomaly_label      # 0 for normal, 1 for anomaly
-                        ])
+            # 4. Use a powerful and fast 'merge_asof' to map every metric row to its corresponding case_id
+            merged_df = pd.merge_asof(
+                left=long_df,
+                right=time_windows_df,
+                left_on='timestamp',
+                right_on='st_time',
+                direction='backward'
+            )
             
-            del df, sampled
-            gc.collect()
+            merged_df = merged_df[merged_df['timestamp'] < merged_df['ed_time']]
+            merged_df.dropna(subset=['case_id'], inplace=True)
+            if merged_df.empty:
+                return None
+
+            # 5. Efficiently detect anomalies for each metric group
+            ksigma = Ksigma()
+            merged_df['is_anomaly_label'] = 0
+            
+            for (case_id, metric_name), group in merged_df.groupby(['case_id', 'metric_name']):
+                st_ts = group['st_time'].iloc[0]
+                ed_ts = group['ed_time'].iloc[0]
+                
+                pivot_for_detection = group[['timestamp', 'metric_value']].set_index('timestamp')
+                pivot_for_detection.columns = [metric_name]
+
+                is_anomaly_present, anomaly_ts, score = ksigma.detection(
+                    pivot_for_detection.reset_index(), metric_name, int(st_ts), int(ed_ts)
+                )
+
+                if is_anomaly_present:
+                    anomaly_index = group[group['timestamp'] == anomaly_ts].index
+                    merged_df.loc[anomaly_index, 'is_anomaly_label'] = 1
+
+            # 6. Format and save the final results to a temporary JSON
+            service = metric_file.stem.split('_')[0] if '_' in metric_file.stem else 'unknown'
+            merged_df['service'] = service
+            
+            case_metrics = {}
+            key_cols = ['timestamp', 'service', 'metric_name', 'metric_value', 'is_anomaly_label']
+            
+            for case_id, group in merged_df.groupby('case_id'):
+                case_metrics[str(int(case_id))] = group[key_cols].values.tolist()
+
+            with open(temp_output_path, 'w') as f:
+                json.dump(case_metrics, f)
+                
+            return temp_output_path
         
         except Exception as e:
             print(f"Error processing {metric_file.name}: {e}")
-        
-        return case_metrics
-    
+            import traceback
+            traceback.print_exc()
+            return None
+            
     def process_metric_data(self, run_table):
-        """Process metric data (30% sampling with K-sigma anomaly detection)"""
+        """Process metric data using a vectorized worker and a JSON-based file shuffle."""
         print("\n" + "="*80)
         print("STEP 3: Processing Metric Data (30% of Files FULLY)")
         print("="*80)
+
+        import shutil
+        temp_results_dir = self.output_path / "temp_metric_results"
+        if temp_results_dir.exists():
+            shutil.rmtree(temp_results_dir)
+        temp_results_dir.mkdir(exist_ok=True)
+        print(f"Using temporary directory for worker results: {temp_results_dir}")
 
         metric_files = list(self.raw_path.glob('metric/metric_split/metric/*.csv'))
         print(f"Found {len(metric_files)} metric files")
 
         import random
         random.seed(42)
-        num_files_to_sample = int(len(metric_files) * 0.3)
+        num_files_to_sample = int(len(metric_files) * self.sample_rate)
         if num_files_to_sample == 0 and len(metric_files) > 0:
             num_files_to_sample = 1
             
         sampled_files = random.sample(metric_files, num_files_to_sample)
-        print(f"Randomly selected 30% of files: {len(sampled_files)} files")
+        print(f"Randomly selected {self.sample_rate*100:.0f}% of files: {len(sampled_files)} files")
         print(f"Using {self.n_workers} parallel workers")
 
         time_windows = []
@@ -453,150 +613,198 @@ class GAIAPreprocessor:
         chunk_size = 200
         
         with Pool(processes=self.n_workers) as pool:
-            # Outer progress bar for chunks
             for i in tqdm(range(0, len(sampled_files), chunk_size), desc="Processing Chunks", position=0):
                 chunk_files = sampled_files[i:i + chunk_size]
-                args_list = [(f, time_windows) for f in chunk_files]
+                args_list = [(f, time_windows, temp_results_dir) for f in chunk_files]
                 
-                # Get an iterator for the results
                 results_iterator = pool.imap_unordered(self.process_metric_data_parallel, args_list)
                 
-                # Inner progress bar for files within the current chunk
                 inner_pbar = tqdm(results_iterator, total=len(chunk_files), desc="Files in Chunk", position=1, leave=False)
                 
-                # Process results, driving the inner progress bar
-                for result in inner_pbar:
-                    for case_id, metrics in result.items():
-                        if case_id in metric_dict:
-                            metric_dict[case_id].extend(metrics)
+                # The result is a path to a temporary JSON file
+                for temp_file_path in inner_pbar:
+                    if temp_file_path:
+                        with open(temp_file_path, 'r') as f:
+                            worker_data = json.load(f)
+                        
+                        # Merge the data from the temp file
+                        for case_id_str, metrics in worker_data.items():
+                            case_id_int = int(case_id_str)
+                            if case_id_int in metric_dict:
+                                metric_dict[case_id_int].extend(metrics)
+                        
+                        # Delete the temporary file after merging
+                        os.remove(temp_file_path)
                 
                 del results_iterator, args_list
                 gc.collect()
 
-        metric_dict = {int(k): v for k, v in metric_dict.items()}
+        print("[Cleanup] Deleting temporary directory...")
+        shutil.rmtree(temp_results_dir)
 
         output_file = self.anomalies_dir / 'demo_metric.json'
-        print(f"\n[Saving] Writing metric data to JSON...")
+        print(f"\n[Saving] Writing final aggregated metric data to JSON...")
         with open(output_file, 'w') as f:
             json.dump(metric_dict, f)
 
         total_metrics = sum(len(v) for v in metric_dict.values())
         print(f"\n[Metric Summary]")
         print(f"  Total cases: {len(metric_dict)}")
-        print(f"  Total metric anomalies detected: {total_metrics:,}")
-        if len(metric_dict) > 0 and total_metrics > 0:
-            print(f"  Avg anomalies per case: {total_metrics/len(metric_dict):.1f}")
+        print(f"  Total metric records generated: {total_metrics:,}")
         print(f"[Saved] {output_file}")
 
         return metric_dict
     
     def process_business_logs_parallel(self, args):
-        """Process single business/log file (for parallel execution)"""
-        log_file, time_windows, sample_rate, use_drain = args
+        """
+        Final robust version that includes a dedicated progress bar for file reading.
+        """
+        import re
+        import _csv
+        log_file, time_windows_list, temp_dir, worker_id = args # Unpack new worker_id
         
-        case_logs = {case_id: [] for case_id, _, _ in time_windows}
-        
+        pid = os.getpid()
+        timestamp = int(time.time() * 1000)
+        temp_output_path = temp_dir / f"log_result_{pid}_{timestamp}.json"
+
         try:
-            # Read entire log file
-            df = pd.read_csv(log_file)
+            time_windows_df = pd.DataFrame(time_windows_list, columns=['case_id', 'st_time', 'ed_time'])
+            time_windows_df['st_time'] = pd.to_datetime(time_windows_df['st_time'], unit='ms', utc=True)
+            time_windows_df['ed_time'] = pd.to_datetime(time_windows_df['ed_time'], unit='ms', utc=True)
+            time_windows_df = time_windows_df.sort_values('st_time')
             
-            # Convert datetime to proper format if needed
-            if 'datetime' in df.columns:
-                df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
-                df = df.dropna(subset=['datetime'])
+            all_results_dfs = []
+
+            iterator = pd.read_csv(log_file, chunksize=50000, engine='python', on_bad_lines='warn')
             
-            if len(df) == 0:
-                return case_logs
-            
-            # Sample 30% of rows
-            sampled = df.sample(frac=sample_rate, random_state=42)
-            
-            # Parse logs (extract event templates)
-            if 'message' in sampled.columns:
-                # Simple pattern extraction: replace numbers and IPs
-                import re
-                sampled['EventId'] = sampled['message'].astype(str).apply(
-                    lambda x: re.sub(r'\d+', '<NUM>', re.sub(r'\d+\.\d+\.\d+\.\d+', '<IP>', str(x)))[:100]
-                )
-            else:
-                sampled['EventId'] = 'unknown'
-            
-            # Process each time window
-            for case_id, st_ts, ed_ts in time_windows:
-                # Convert milliseconds to datetime
-                st_time = pd.Timestamp(st_ts / 1000, unit='s')
-                ed_time = pd.Timestamp(ed_ts / 1000, unit='s')
+            try:
+                # === FIX: Add a tqdm progress bar for reading chunks within this worker ===
+                pbar_chunk = tqdm(iterator, desc=f"Worker {worker_id} Reading {log_file.name}", position=worker_id + 1, leave=False)
                 
-                # Filter logs in time window
-                mask = (sampled['datetime'] >= st_time) & (sampled['datetime'] <= ed_time)
-                case_data = sampled[mask]
-                
-                if len(case_data) == 0:
-                    continue
-                
-                # Extract log events (timestamp, service, EventId)
-                for _, row in case_data.iterrows():
-                    timestamp = pd.Timestamp(row['datetime']).timestamp() * 1000
-                    service = row.get('service', 'unknown')
-                    event_id = row.get('EventId', str(row.get('message', ''))[:50])
+                for df_chunk in pbar_chunk:
+                # =========================================================================
+                    if 'message' not in df_chunk.columns or df_chunk['message'].isnull().all():
+                        continue
+
+                    df_chunk['datetime'] = pd.to_datetime(
+                        df_chunk['message'].str.extract(r'(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})', expand=False),
+                        errors='coerce'
+                    )
+                    df_chunk['datetime'] = df_chunk['datetime'].dt.tz_localize('UTC')
+
+                    df_chunk.dropna(subset=['datetime'], inplace=True)
+                    if df_chunk.empty:
+                        continue
                     
-                    case_logs[case_id].append([timestamp, service, event_id])
+                    df_chunk = df_chunk.sort_values('datetime')
+                    
+                    merged_df = pd.merge_asof(
+                        left=df_chunk, right=time_windows_df,
+                        left_on='datetime', right_on='st_time',
+                        direction='backward'
+                    )
+                    
+                    merged_df = merged_df[merged_df['datetime'] < merged_df['ed_time']]
+                    merged_df.dropna(subset=['case_id'], inplace=True)
+
+                    if merged_df.empty:
+                        continue
+
+                    merged_df['EventId'] = merged_df['message'].astype(str).str.replace(r'\d+', '<NUM>', regex=True).str[:100]
+                    all_results_dfs.append(merged_df)
+
+            except _csv.Error as e:
+                print(f"\n[WARNING] CSV parsing error in {log_file.name}: '{e}'. File is corrupt. "
+                    f"Processing with data recovered so far.\n")
             
-            del df, sampled
-            gc.collect()
-        
+            if not all_results_dfs:
+                return None
+
+            full_df = pd.concat(all_results_dfs, ignore_index=True)
+            
+            case_logs = {}
+            full_df['timestamp_ms'] = (full_df['datetime'].astype(np.int64) / 1_000_000).astype(np.int64)
+            key_cols = ['timestamp_ms', 'service', 'EventId']
+
+            for case_id, group in full_df.groupby('case_id'):
+                case_logs[str(int(case_id))] = group[key_cols].values.tolist()
+
+            with open(temp_output_path, 'w') as f:
+                json.dump(case_logs, f)
+            
+            return temp_output_path
+
         except Exception as e:
-            print(f"Error processing {log_file.name}: {e}")
-        
-        return case_logs
-    
+            print(f"An error occurred in process_business_logs_parallel for {log_file.name}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+            
     def process_business_logs(self, run_table):
-        """Process business/log data (30% sampling)"""
+        """Process business/log data with detailed progress tracking for each worker."""
         print("\n" + "="*80)
-        print("STEP 4: Processing Business/Log Data (30% Sampling)")
+        print("STEP 4: Processing Business/Log Data")
         print("="*80)
-        
+
+        import shutil
+        temp_results_dir = self.output_path / "temp_log_results"
+        if temp_results_dir.exists():
+            shutil.rmtree(temp_results_dir)
+        temp_results_dir.mkdir(exist_ok=True)
+        print(f"Using temporary directory for worker results: {temp_results_dir}")
+
         log_files = list(self.raw_path.glob('business/*.csv'))
         print(f"Found {len(log_files)} business log files")
+        if not log_files:
+            print("[INFO] No business log files found to process.")
+            return []
+        
         print(f"Using {self.n_workers} parallel workers")
         
-        # Pre-compute time windows as list (not dict!)
         time_windows = []
         for idx, case in run_table.iterrows():
             st_ts = pd.Timestamp(case['st_time']).timestamp() * 1000
             ed_ts = pd.Timestamp(case['ed_time']).timestamp() * 1000
             time_windows.append((case['case_id'], st_ts, ed_ts))
         
-        # Prepare arguments for parallel processing
-        use_drain = (DrainParser is not None)
-        args_list = [(f, time_windows, self.sample_rate, use_drain) for f in log_files]
+        # === FIX: Add 'enumerate' to pass a unique worker_id to each job ===
+        args_list = [(f, time_windows, temp_results_dir, i) for i, f in enumerate(log_files)]
+        # ===================================================================
         
-        # Process in parallel
+        log_list_dict = {i: [] for i in range(len(run_table))}
+
         with Pool(processes=self.n_workers) as pool:
-            results = list(tqdm(
-                pool.imap(self.process_business_logs_parallel, args_list),
-                total=len(args_list),
-                desc="Processing business log files"
-            ))
+            # This main progress bar will track the overall file completion
+            pbar_main = tqdm(total=len(args_list), desc="Overall Log File Progress", position=0)
+            
+            for temp_file_path in pool.imap_unordered(self.process_business_logs_parallel, args_list):
+                if temp_file_path:
+                    with open(temp_file_path, 'r') as f:
+                        worker_data = json.load(f)
+                    
+                    for case_id_str, logs in worker_data.items():
+                        case_id_int = int(case_id_str)
+                        if case_id_int in log_list_dict:
+                            log_list_dict[case_id_int].extend(logs)
+                    
+                    os.remove(temp_file_path)
+                
+                pbar_main.update(1) # Manually update the main progress bar
+            
+            pbar_main.close()
+
+        print("\n[Cleanup] Deleting temporary directory...")
+        shutil.rmtree(temp_results_dir)
         
-        # Merge results
-        log_list = []
-        for case_id in range(len(run_table)):
-            case_logs = []
-            for result in results:
-                case_logs.extend(result[case_id])
-            log_list.append(case_logs)
-        
-        # Save as NPY array (DiagFusion format)
+        log_list = [log_list_dict[i] for i in sorted(log_list_dict.keys())]
+
         output_file = self.anomalies_dir / 'stratification_logs.npy'
         np.save(output_file, log_list, allow_pickle=True)
         
         total_logs = sum(len(logs) for logs in log_list)
         print(f"\n[Business Log Summary]")
         print(f"  Total cases: {len(log_list)}")
-        print(f"  Total log records: {total_logs:,}")
-        if len(log_list) > 0:
-            print(f"  Avg logs per case: {total_logs/len(log_list):.1f}")
+        print(f"  Total log records generated: {total_logs:,}")
         print(f"[Saved] {output_file}")
         
         return log_list
@@ -632,10 +840,10 @@ class GAIAPreprocessor:
                 print("  Run full preprocessing if you need to regenerate trace data")
             
             # Step 3: Process metric data (30% with anomaly detection)
-            metric_dict = self.process_metric_data(run_table)
+            #metric_dict = self.process_metric_data(run_table)
             
             # Step 4: Process business/log data (30%)
-            log_list = self.process_business_logs(run_table)
+            #log_list = self.process_business_logs(run_table)
             
             # Summary
             elapsed_time = time.time() - start_time
@@ -692,8 +900,8 @@ def main():
     parser.add_argument(
         '--sample-rate',
         type=float,
-        default=0.3,
-        help='Sampling rate for metric/business data (0.3 = 30%%)'
+        default=1,
+        help='Sampling rate for metric/business data (1 = 100%%)'
     )
     
     args = parser.parse_args()
