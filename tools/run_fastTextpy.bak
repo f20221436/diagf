@@ -1,0 +1,384 @@
+# tools/run_fasttext_lab.py
+import sys
+import os
+# Add the parent directory (diagf) to the Python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+import fasttext
+import pickle
+import time
+import random
+import pandas as pd
+
+
+# Import your project's helpers
+import public_function as pf
+from transforms.events.fasttext_with_DA import FastTextLab  # will use the class you posted
+
+# ---- Small monkey-patch helpers to make FastTextLab robust ----
+# We'll patch two methods at runtime: event_embedding_lab and a safer get_nearest helper.
+
+def patched_event_embedding_lab(self, data_path):
+    """
+    Train (or load) a fastText model on data_path and return dict token->np.array(vector).
+    Uses model.get_words() and model.get_word_vector() for compatibility.
+    Skips tokens that look like fastText labels (__label__*).
+    """
+    model = self.method(data_path,
+                        dim=self.config.get('vector_dim', 100),
+                        minCount=self.config.get('minCount', 1),
+                        minn=0, maxn=0,
+                        epoch=self.config.get('epoch', 5))
+    event_dict = {}
+    # get list of words in a robust way
+    words = []
+    try:
+        words = model.get_words()
+    except Exception:
+        # some bindings might expose model.words
+        try:
+            words = list(model.words)
+        except Exception:
+            words = []
+
+    for w in words:
+        if isinstance(w, str) and w.startswith("__label__"):
+            continue
+        try:
+            vec = np.array(model.get_word_vector(w), dtype=np.float32)
+            event_dict[w] = vec
+        except Exception:
+            # skip problematic tokens
+            continue
+    return event_dict
+
+def safe_get_nearest_word(model, token):
+    """
+    Return a nearest neighbor string for token or token itself if no neighbor.
+    Handles empty results.
+    """
+    try:
+        neighs = model.get_nearest_neighbors(token)
+        if not neighs:
+            return token
+        # neighs is list of tuples (score, word) or (word, score). Pick the last element of first tuple as word if needed.
+        first = neighs[0]
+        # try common tuple shapes
+        if isinstance(first, tuple) and len(first) >= 2:
+            # determine which entry looks like a string word
+            if isinstance(first[0], str):
+                return first[0]
+            else:
+                return first[-1]
+        # fallback
+        return str(first)
+    except Exception:
+        return token
+
+# Apply patches
+FastTextLab.event_embedding_lab = patched_event_embedding_lab
+
+# Patch the w2v_DA function to use safe_get_nearest_word
+_orig_w2v = FastTextLab.w2v_DA
+def patched_w2v_DA(self):
+    # copy of original logic but replacing nearest neighbor retrieval robustly
+    """
+    Block-level WA: build augmented training data by duplicating whole-case blocks.
+    Each block = K_S lines (one line per node in canonical self.nodes order).
+    When augmenting a node, we copy the entire block and replace only that node's line
+    with the augmented line. This guarantees the final train_da.txt line count is
+    a multiple of K_S and preserves correct case→embedding grouping.
+    """
+    import os
+    random.seed(0)
+
+    # === Basic checks / initial model on original train file ===
+    train_file_path = self.config.get('train_path')
+    if not train_file_path or not os.path.exists(train_file_path):
+        raise FileNotFoundError(f"[patched_w2v_DA] train_path not found: {train_file_path}")
+
+    print(f"DEBUG patched_w2v_DA: Training initial fastText model on: {train_file_path}")
+    model = self.method(train_file_path,
+                        dim=self.config['vector_dim'],
+                        minCount=self.config['minCount'],
+                        minn=0, maxn=0,
+                        epoch=self.config['epoch'])
+
+    # Load existing train lines (must match the exact K_S ordering produced by save_to_txt)
+    K_S = len(self.nodes)
+    base_lines = []
+    with open(train_file_path, 'r', encoding='utf-8') as f:
+        base_lines = [ln.rstrip('\n') for ln in f]
+
+    if len(base_lines) == 0:
+        raise ValueError("[patched_w2v_DA] No lines found in train file.")
+
+    # Trim any trailing partial block (shouldn't normally happen if save_to_txt is correct)
+    if len(base_lines) % K_S != 0:
+        print(f"[patched_w2v_DA] WARNING: train file lines ({len(base_lines)}) not divisible by K_S={K_S}. Truncating extra lines.")
+        base_lines = base_lines[: (len(base_lines) // K_S) * K_S]
+
+    # Build block list (each block = K_S consecutive lines)
+    blocks = [base_lines[i:i+K_S] for i in range(0, len(base_lines), K_S)]
+    print(f"DEBUG patched_w2v_DA: Read {len(blocks)} base blocks (cases).")
+
+    # For faster lookups, precompute per-block the label at each node position
+    # We'll treat node index/order as node_pos = self.node_labels[node_name]
+    # Note: the per-line label is after the last tab.
+    def _line_label(line):
+        if '\t' not in line:
+            return None
+        return line.rsplit('\t', 1)[-1].strip()
+
+    # Start augmentation loop over anomaly types and nodes (block-level)
+    print(f"DEBUG patched_w2v_DA: Starting block-level Data Augmentation loop...")
+    target_sample_goal = int(self.config.get('sample_count', 0))
+    for anomaly_type_name, anomaly_type_idx in self.anomaly_type_labels.items():
+        for node_name, node_idx in self.node_labels.items():
+            target_label_str = f"__label__{node_idx}{anomaly_type_idx}"
+
+            # find block indices where the node's line label == target_label_str
+            candidate_block_idxs = []
+            for b_idx, block in enumerate(blocks):
+                # defensive: ensure block has K_S elements
+                if node_idx >= len(block):
+                    continue
+                lbl = _line_label(block[node_idx])
+                if lbl == target_label_str:
+                    candidate_block_idxs.append(b_idx)
+
+            sample_count_blocks = len(candidate_block_idxs)
+            print(f"DEBUG patched_w2v_DA: Class '{node_name}'-'{anomaly_type_name}' ({target_label_str}) -> initial blocks: {sample_count_blocks}")
+
+            if sample_count_blocks == 0:
+                # nothing to augment from
+                continue
+            if sample_count_blocks >= target_sample_goal:
+                # already enough case-blocks
+                continue
+
+            # Augmentation: create new blocks by copying an existing block and replacing the node's line
+            needed = target_sample_goal - sample_count_blocks
+            loop_limit = 10 * max(1, target_sample_goal)
+            loop = 0
+            while sample_count_blocks < target_sample_goal and loop < loop_limit:
+                loop += 1
+                # choose a random block (index) from existing candidate blocks
+                chosen_bidx = random.choice(candidate_block_idxs)
+                orig_block = blocks[chosen_bidx]
+                # original line for the node
+                orig_line = orig_block[node_idx]
+                if '\t' not in orig_line:
+                    continue
+                chosen_text = orig_line.split('\t', 1)[0].strip()
+                # skip very short samples
+                if not chosen_text:
+                    continue
+                tokens = chosen_text.split()
+                if len(tokens) < self.config.get('minCount', 1):
+                    continue
+
+                # number of edits
+                num_to_edit = min(self.config.get('edit_count', 1), len(tokens))
+                edit_ids = random.sample(range(len(tokens)), num_to_edit)
+                new_tokens = list(tokens)
+                # replace selected tokens with nearest neighbor from model (safe_get_nearest_word is defined earlier in run_fasttext.py)
+                for ei in edit_ids:
+                    try:
+                        # use model.get_nearest_neighbors but fall back to token if no neighbor
+                        neigh = model.get_nearest_neighbors(new_tokens[ei])
+                        if not neigh:
+                            replacement = new_tokens[ei]
+                        else:
+                            first = neigh[0]
+                            # tuple shapes vary; pick the element that is a string
+                            if isinstance(first, tuple) and len(first) >= 2:
+                                replacement = first[0] if isinstance(first[0], str) else first[-1]
+                            else:
+                                replacement = str(first)
+                    except Exception:
+                        replacement = new_tokens[ei]
+                    new_tokens[ei] = replacement
+
+                augmented_line = ' '.join(new_tokens) + f'\t{target_label_str}'
+
+                # build new block: copy original block and replace only the node line
+                new_block = list(orig_block)
+                new_block[node_idx] = augmented_line
+
+                # append new block to blocks (so subsequent augmentations can pick from them too)
+                blocks.append(new_block)
+                candidate_block_idxs.append(len(blocks) - 1)  # newly added block is also a candidate
+                sample_count_blocks += 1
+
+            print(f"   └── Augmented: target {target_sample_goal}, final blocks: {sample_count_blocks} (added {sample_count_blocks - len(candidate_block_idxs) if sample_count_blocks - len(candidate_block_idxs) else 'N/A'})")
+
+    # Flatten blocks back to lines and write augmented file
+    out_lines = []
+    for block in blocks:
+        # ensure block length == K_S by padding placeholders if necessary (defensive)
+        if len(block) < K_S:
+            # fallback: pad with placeholders and normal label
+            placeholder_label = "__label__00"
+            while len(block) < K_S:
+                block.append(f"__NO_EVENT__\t{placeholder_label}")
+        out_lines.extend(block)
+
+    augmented_file_path = self.config.get('train_da_path')
+    if not augmented_file_path:
+        raise ValueError("[patched_w2v_DA] 'train_da_path' not configured")
+
+    print(f"\nDEBUG patched_w2v_DA: Writing {len(out_lines)} total lines (original blocks + augmented blocks) to: {augmented_file_path}")
+    os.makedirs(os.path.dirname(augmented_file_path), exist_ok=True)
+    try:
+        with open(augmented_file_path, 'w', encoding='utf-8') as f:
+            for ln in out_lines:
+                f.write(ln + '\n')
+        print("DEBUG patched_w2v_DA: Augmented data saved successfully.")
+    except Exception as e:
+        print(f"[ERROR] patched_w2v_DA: Failed to write augmented data file: {e}")
+        raise
+
+def generate_fasttext_pickle(config, cases, out_pkl_path=None):
+    """
+    Create a FastTextLab and run do_lab() to produce the pickle.
+    If out_pkl_path is provided, move/rename the produced file to that path.
+    """
+    lab = FastTextLab(config, cases)
+    start = time.time()
+    lab.do_lab()
+    end = time.time()
+    print("fasttext done in %.2f s" % (end-start))
+    produced_path = config['save_path']
+    if out_pkl_path and produced_path != out_pkl_path:
+        os.makedirs(os.path.dirname(out_pkl_path), exist_ok=True)
+        os.replace(produced_path, out_pkl_path)
+        print("moved", produced_path, "->", out_pkl_path)
+    print("Saved embedding to:", out_pkl_path or produced_path)
+
+if __name__ == "__main__":
+    # --- ADD ArgumentParser ---
+    import argparse
+    parser = argparse.ArgumentParser(description="Run FastText Training")
+    parser.add_argument('--config', type=str, default='gaia_config.yaml', 
+                        help='Path to the main configuration file (relative to diagf directory)')
+    args = parser.parse_args()
+    # --- END ADD ---
+
+    # You must have the repo's public_function.get_config() / deal_config available
+    from public_function import get_config, deal_config
+
+    # --- Pass the config filename to get_config ---
+    config_filename = args.config 
+    print(f"DEBUG: Loading main config from: {config_filename}")
+    repo_cfg = get_config(config_file=config_filename) # Pass filename here
+    # --- END CHANGE ---
+
+    # Check if config loaded successfully
+    if repo_cfg is None:
+        raise ValueError(f"Could not load configuration from {config_filename}")
+
+    # Extract the 'fasttext' section
+    cfg = deal_config(repo_cfg, 'fasttext')
+    
+    
+    def _resolve_path(p):
+        if not p:
+            return None
+        if os.path.isabs(p):
+            return os.path.normpath(p)
+        # assume paths relative to repository root (diagf parent)
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.normpath(os.path.join(repo_root, p))
+
+    # Normalize expected keys to absolute paths if they're present
+    path_keys = ['text_path', 'labels_path', 'save_path', 'train_path', 'test_path', 'train_da_path']
+    for k in path_keys:
+        if k in cfg and cfg[k]:
+            cfg[k] = _resolve_path(cfg[k])
+
+    # Ensure text_path exists (this is the metric_trace_text.pkl that save_to_txt will read)
+    if not cfg.get('text_path') or not os.path.exists(cfg.get('text_path')):
+        raise FileNotFoundError(f"[FASTTEXT] Required file text_path not found: {cfg.get('text_path')}")
+
+    # Ensure the labels/cases file exists (labels_path is used to build cases DataFrame/Pkl)
+    if not cfg.get('labels_path') or not os.path.exists(cfg.get('labels_path')):
+        raise FileNotFoundError(f"[FASTTEXT] Required labels_path not found: {cfg.get('labels_path')}")
+
+    # Ensure local temp dirs for train/test/da exist (so save_to_txt and augmentation can write)
+    for key in ['train_path', 'test_path', 'train_da_path']:
+        p = cfg.get(key)
+        if p:
+            d = os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+    # Provide helpful debug output before running
+    print("[FASTTEXT] Final fasttext config (paths):")
+    for k in path_keys:
+        if k in cfg:
+            print(f"  {k}: {cfg.get(k)}")
+    print(f"[FASTTEXT] sample_count: {cfg.get('sample_count')}  edit_count: {cfg.get('edit_count')}")
+        
+    # --- Ensure temporary directories exist ---
+    temp_paths = [cfg.get('train_path'), cfg.get('test_path'), cfg.get('train_da_path')]
+    for path in temp_paths:
+        if path: 
+            dir_name = os.path.dirname(path)
+            if dir_name: 
+                os.makedirs(dir_name, exist_ok=True)
+                # print(f"Ensured temporary directory exists: {dir_name}") # Optional print
+    # --- End directory check ---
+    
+    # --- Load Labels ---
+    labels = None
+    labels_file_path = None
+    
+    # Try common config keys to find the path
+    for k in ['labels_path', 'label_path', 'labels', 'data_path']:
+        if k in cfg: 
+            current_path_to_check = cfg[k]
+            # --- Convert relative path from config to absolute path ---
+            # Assumes the path in config is relative to the 'diagf' directory
+            if not os.path.isabs(current_path_to_check):
+                 diagf_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # Get diagf dir
+                 current_path_to_check = os.path.join(diagf_dir, current_path_to_check)
+                 current_path_to_check = os.path.normpath(current_path_to_check)
+            # --- End conversion ---
+            print(f"DEBUG: Checking for labels file at absolute path: {current_path_to_check}") 
+            if os.path.exists(current_path_to_check):
+                labels_file_path = current_path_to_check
+                break
+
+    if labels_file_path:
+        print(f"Attempting to load labels from: {labels_file_path}")
+        try:
+            if labels_file_path.endswith('.csv'):
+                labels = pd.read_csv(labels_file_path)
+                if 'case_id' in labels.columns:
+                     labels = labels.set_index('case_id')
+                print("Successfully loaded labels from CSV.")
+            elif labels_file_path.endswith('.pkl'):
+                labels = pf.load(labels_file_path) # Assumes pf.load handles absolute paths
+                print("Successfully loaded labels from PKL.")
+            else:
+                print(f"[Warning] Unknown file type for labels: {labels_file_path}")
+        except Exception as e:
+            print(f"[Error] Failed to load labels file '{labels_file_path}': {e}")
+            labels = None 
+
+    if labels is None:
+        # (Keep the existing fallback logic here if needed, but it should find the file now)
+        raise FileNotFoundError("Could not find or load labels/cases. Please verify 'labels_path' in your config and ensure the file exists.")
+
+    # --- Run and Save ---
+    # Construct absolute output path if save_path is relative
+    output_path = cfg.get('save_path')
+    if output_path and not os.path.isabs(output_path):
+         diagf_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         output_path = os.path.join(diagf_dir, output_path)
+         output_path = os.path.normpath(output_path)
+         print(f"DEBUG: Resolved output save_path to: {output_path}")
+
+    generate_fasttext_pickle(cfg, labels, out_pkl_path=output_path)

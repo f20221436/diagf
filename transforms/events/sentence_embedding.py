@@ -62,8 +62,12 @@ def tfidf_word_embedding(tfidf_matrix, data_dict, texts, word_dict, service_num)
     
     # Check if number of texts matches expected structure
     if total_texts > 0 and service_num > 0 and total_texts % service_num != 0:
-         print(f"[WARNING] tfidf_word_embedding: Total texts ({total_texts}) is not a multiple of service_num ({service_num}). Final structure might be incorrect.")
-
+        remainder = len(texts) % service_num
+        if remainder != 0:
+            print(f"[INFO] Dropping {remainder} extra lines to align with service_num={service_num}.")
+            texts = texts[:len(texts) - remainder]
+            print(f"[INFO] After trimming: {len(texts)} text entries (perfectly divisible by {service_num}).")
+    
     for count, text in enumerate(tqdm(texts, desc="Generating Embeddings")):
         temp = np.zeros(length, dtype=np.float32) # Initialize embedding vector for this sentence
         

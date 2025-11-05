@@ -31,7 +31,7 @@ fasttext:
 
   # --- Model Parameters (Keep these as they were) ---
   vector_dim: 100
-  sample_count: 1000 # Used for Data Augmentation (DA)
+  sample_count: 3000 # Used for Data Augmentation (DA)
   edit_count: 1     # Used for Data Augmentation (DA)
   da_method: 'w2v'  # Keep if you are using the DA method
   minCount: 1
@@ -39,10 +39,10 @@ fasttext:
 
 sentence_embedding:
   K_S: 10 
-  train_path: 'fasttext/temp/train.txt'
-  test_path: 'fasttext/temp/test.txt'
+  train_path: 'fasttext_temp/train_da.txt'
+  test_path: 'fasttext_temp/test.txt'
   source_path: 'fasttext/event_embedding.pkl'
-  save_path: 'sentence_embedding.pkl'
+  save_path: 'anomalies/sentence_embedding'
 
 he_dgl:
   # --- CRITICAL PATHS ---
@@ -82,7 +82,7 @@ he_dgl:
   batch_size: 64    
   lr: 0.001
   weight_decay: 0.0001
-  epoch: 5         
+  epoch: 200      
   win_size: 50       
   win_threshold: 0.0001 
   aug: False         
@@ -115,3 +115,10 @@ feature_list:
   5: TFIDF_NGram_X,
   6: BOW_NGram_X
 feature: feature_list[0]
+
+multitask:
+  enable: true                 # Enable multitask learning
+  heads: ["service", "anomaly"]  # Predict both service group & anomaly type
+  loss_weights:                # Relative importance of each head during training
+    service: 1.0
+    anomaly: 1.0

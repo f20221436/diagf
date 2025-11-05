@@ -2,6 +2,7 @@ import os
 import pickle
 import argparse
 import yaml
+import sys
 
 
 def load(file):
@@ -15,14 +16,31 @@ def save(file, data):
         pickle.dump(data, f)
 
 
-def get_config():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config')
-    args = parser.parse_args()
-    with open(os.path.join('./config', args.config), 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    return config
+def get_config(config_file='gaia_config.yaml'):
+    
+    config_path = config_file # Assume absolute or relative to CWD initially
+    
+    if not os.path.isabs(config_file):
+        script_dir = os.path.dirname(os.path.abspath(__file__)) 
+        # Path 1: Inside a 'config' subdirectory relative to this script
+        path_in_config_subdir = os.path.join(script_dir, 'config', config_file) 
+        # Path 2: Directly in the same directory as this script
+        path_in_script_dir = os.path.join(script_dir, config_file) 
 
+        if os.path.exists(path_in_config_subdir):
+            config_path = path_in_config_subdir
+        elif os.path.exists(path_in_script_dir):
+            config_path = path_in_script_dir
+        # If neither found, it will try the original config_file path (relative to CWD)
+
+    config_path = os.path.normpath(config_path)
+
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f) 
+        return config
+    except Exception: # Catch FileNotFoundError and other loading errors silently
+        return None
 
 def min_max_normalized(feature):
     feature_copy = feature.copy().astype(float)

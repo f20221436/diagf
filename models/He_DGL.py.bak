@@ -420,121 +420,262 @@ class RawDataProcess():
 
     # Inside the RawDataProcess class in He_DGL.py
     # Inside the RawDataProcess class in He_DGL.py
-    # ...existing code...
+    def process(self):
+        """
+        Prepares label files and correctly handles traditional vs. streaming embeddings.
+        Robust: discovers metadata/chunk folder variants, validates paths, and writes
+        streaming placeholders into the processed-data subfolder(s) where the loader expects them.
+        """
+        import pickle, gc
 
-    def process(self, runtable_path, xs_path, ys_task, save_dir):
-        """
-        Process raw data to create train/test splits for labels.
-        Now handles metadata-based filtering BEFORE splitting.
-        """
-        print('📊 Processing and splitting label files...')
-        
-        # Load the run table
-        run_table = pd.read_csv(runtable_path)
-        
-        # Get metadata to find actual number of cases with embeddings
-        total_cases = None
+        # --- Load Run Table ---
+        run_table_path = os.path.join(self.config['data_dir'], self.config['run_table'])
         try:
-            xs_base = xs_path
-            base_dir = os.path.dirname(xs_base)
-            base_name = os.path.basename(xs_base).replace(".pkl", "")
-            candidates_meta = [
-                os.path.join(base_dir, f"{base_name}_metadata.pkl"),
-                os.path.join(base_dir, base_name, f"{base_name}_metadata.pkl"),
-                os.path.join(base_dir, f"{base_name}_chunked", f"{base_name}_metadata.pkl"),
-                os.path.join(base_dir, f"{base_name}_chunks", f"{base_name}_metadata.pkl"),
-            ]
-            meta_path = next((p for p in candidates_meta if os.path.exists(p)), None)
-            if meta_path:
-                with open(meta_path, 'rb') as mf:
-                    meta = pickle.load(mf)
-                total_cases = int(meta.get('total_cases', None)) if meta else None
-                print(f"[INFO] Found metadata with {total_cases} cases")
-        except Exception as e:
-            print(f"[WARNING] Could not load metadata: {e}")
-            total_cases = None
-        
-        # FIRST: Filter run_table to match embedding count
-        if total_cases and len(run_table) > total_cases:
-            if 'case_id' in run_table.columns:
-                run_table = run_table[run_table['case_id'] < total_cases].copy()
-                print(f"[INFO] Filtered run_table from {len(run_table)} to {total_cases} rows (metadata-based)")
+            run_table = pd.read_csv(run_table_path)
+            if 'data_type' not in run_table.columns:
+                print("[WARNING] 'data_type' column missing in run_table. Attempting 80/20 split based on index.")
+                train_size = int(len(run_table) * 0.8)
+                run_table['data_type'] = ['train'] * train_size + ['test'] * (len(run_table) - train_size)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Run table file not found at: {run_table_path}")
+        except ValueError as e:
+            raise ValueError(f"Error processing run_table columns: {e}")
+
+        save_dir = self.config['save_dir']
+        os.makedirs(save_dir, exist_ok=True) # Ensure save_dir exists
+
+        # --- Process and Save Labels ---
+        print("📊 Processing and splitting label files...")
+        label_types = ['anomaly_type', 'service']
+        label_dict = {}
+
+        # --- CORRECTED INDEX SPLITTING WITH FALLBACK ---
+        train_index = np.array([], dtype=int) # Initialize as empty
+        test_index = np.array([], dtype=int)  # Initialize as empty
+
+        if 'data_type' in run_table.columns and \
+           run_table['data_type'].isin(['train', 'test']).any():
+            print("[INFO] Attempting split based on 'data_type' column.")
+            train_index = np.where(run_table['data_type'].values == 'train')[0]
+            test_index = np.where(run_table['data_type'].values == 'test')[0]
+
+        # Check if indices were successfully found using 'data_type'
+        if len(train_index) == 0 or len(test_index) == 0:
+            if 'data_type' not in run_table.columns:
+                 print("[WARNING] 'data_type' column missing in run_table.")
             else:
-                run_table = run_table.iloc[:total_cases].copy()
-                print(f"[INFO] Sliced run_table to first {total_cases} rows")
-        
-        # Reset index after filtering
-        run_table = run_table.reset_index(drop=True)
-        
-        # SECOND: Determine train/test split indices (NOW on filtered data)
-        if 'data_type' in run_table.columns:
-            unique_data_types = run_table['data_type'].dropna().unique()
-            
-            if 'train' in unique_data_types and 'test' in unique_data_types:
-                print("[INFO] Using 'data_type' column for train/test split.")
-                train_indices = run_table[run_table['data_type'] == 'train'].index.tolist()
-                test_indices = run_table[run_table['data_type'] == 'test'].index.tolist()
-                print(f"   Train indices count: {len(train_indices)}")
-                print(f"   Test indices count: {len(test_indices)}")
+                 print("[WARNING] No 'train' or 'test' values found (or usable) in 'data_type' column.")
+            print("[INFO] Using fallback 80/20 split based on index.")
+            num_samples = len(run_table)
+            if num_samples == 0:
+                 print("[ERROR] Run table is empty! Cannot split indices.")
+                 # Handle appropriately - maybe raise error or continue with empty indices
             else:
-                print("[WARNING] No 'train' or 'test' values found in 'data_type' column.")
-                print("[INFO] Using fallback 80/20 split based on filtered data.")
-                all_indices = list(range(len(run_table)))  # ← NOW based on filtered length!
-                train_size = int(len(all_indices) * 0.8)
-                train_indices = all_indices[:train_size]
-                test_indices = all_indices[train_size:]
-                print(f"   Train indices count: {len(train_indices)}")
-                print(f"   Test indices count: {len(test_indices)}")
+                train_size = int(num_samples * 0.8)
+                all_indices = np.arange(num_samples)
+                # np.random.shuffle(all_indices) # Optional: Shuffle before splitting
+                train_index = all_indices[:train_size]
+                test_index = all_indices[train_size:]
+
+        # Final check if indices were successfully created by either method
+        if len(train_index) == 0 or len(test_index) == 0:
+             # This should only happen if run_table was empty initially
+             print("[CRITICAL WARNING] Train or test index arrays are EMPTY. Label files will be empty.")
         else:
-            print("[WARNING] No 'data_type' column found in run table.")
-            print("[INFO] Using fallback 80/20 split based on filtered data.")
-            all_indices = list(range(len(run_table)))  # ← NOW based on filtered length!
-            train_size = int(len(all_indices) * 0.8)
-            train_indices = all_indices[:train_size]
-            test_indices = all_indices[train_size:]
-            print(f"   Train indices count: {len(train_indices)}")
-            print(f"   Test indices count: {len(test_indices)}")
-        
-        # THIRD: Generate labels for each task (already filtered via get_label)
-        for label_type in ys_task:
+             print(f"   Train indices count: {len(train_index)}")
+             print(f"   Test indices count: {len(test_index)}")
+        # --- END INDEX SPLITTING CORRECTION ---
+
+        # --- Label Saving Loop (Keep the detailed debugging from previous step) ---
+        for label_type in label_types:
             print(f"\n--- Processing Label Type: {label_type} ---")
-            
-            labels, method, ordered = self.get_label(label_type, run_table)  # ← Uses filtered run_table
-            
-            print(f"   DEBUG: Got full labels array. Shape: {labels.shape}, Type: {labels.dtype}, Unique values: {np.unique(labels)}")
-            
-            # Slice labels using the NEW indices (based on filtered data)
-            if len(train_indices) > 0 and max(train_indices) < len(labels):
-                train_labels = labels[train_indices]
-                print(f"   DEBUG: Sliced train labels shape: {train_labels.shape}")
-            else:
-                print(f"   [ERROR] Cannot slice train labels: Max train index ({max(train_indices) if train_indices else 'N/A'}) >= label length ({len(labels)}) or labels empty.")
-                train_labels = np.array([])
-                print(f"   DEBUG: Sliced train labels shape: {train_labels.shape}")
-            
-            if len(test_indices) > 0 and max(test_indices) < len(labels):
-                test_labels = labels[test_indices]
-                print(f"   DEBUG: Sliced test labels shape: {test_labels.shape}")
-            else:
-                print(f"   [ERROR] Cannot slice test labels: Max test index ({max(test_indices) if test_indices else 'N/A'}) >= label length ({len(labels)}) or labels empty.")
-                test_labels = np.array([])
-                print(f"   DEBUG: Sliced test labels shape: {test_labels.shape}")
-            
-            # Save labels
-            train_save_path = os.path.join(save_dir, f'train_ys_{label_type}.pkl')
-            test_save_path = os.path.join(save_dir, f'test_ys_{label_type}.pkl')
-            
-            print(f"   DEBUG: Saving train labels to: {train_save_path}")
-            U.save_info(train_save_path, train_labels)
-            print(f"   DEBUG: Train labels saved? Exists: {os.path.exists(train_save_path)}, Size: {os.path.getsize(train_save_path)} bytes")
-            
-            print(f"   DEBUG: Saving test labels to: {test_save_path}")
-            U.save_info(test_save_path, test_labels)
-            print(f"   DEBUG: Test labels saved? Exists: {os.path.exists(test_save_path)}, Size: {os.path.getsize(test_save_path)} bytes")
-        
-        print('✅ Label files processing complete.')
-        
-        # ... rest of the method (embedding splitting/streaming) ...
+            try:
+                 # Step 1: Get all labels for this type
+                 labels = self.get_label(label_type, run_table)
+                 print(f"   DEBUG: Got full labels array. Shape: {labels.shape}, Type: {labels.dtype}, Unique values: {np.unique(labels).tolist()}")
+
+                 # Step 2: Slice the labels using the calculated indices
+                 train_labels_to_save = np.array([]) # Default to empty
+                 test_labels_to_save = np.array([])  # Default to empty
+
+                 # Only slice if indices and labels are valid
+                 if len(labels) > 0 and len(train_index) > 0 and train_index.max() < len(labels):
+                      train_labels_to_save = labels[train_index]
+                 elif len(train_index) > 0:
+                      print(f"   [ERROR] Cannot slice train labels: Max train index ({train_index.max()}) >= label length ({len(labels)}) or labels empty.")
+
+                 if len(labels) > 0 and len(test_index) > 0 and test_index.max() < len(labels):
+                      test_labels_to_save = labels[test_index]
+                 elif len(test_index) > 0:
+                      print(f"   [ERROR] Cannot slice test labels: Max test index ({test_index.max()}) >= label length ({len(labels)}) or labels empty.")
+
+                 print(f"   DEBUG: Sliced train labels shape: {train_labels_to_save.shape}")
+                 print(f"   DEBUG: Sliced test labels shape: {test_labels_to_save.shape}")
+
+                 # Step 3: Save the sliced labels
+                 train_save_path = os.path.join(save_dir, f'train_ys_{label_type}.pkl')
+                 test_save_path = os.path.join(save_dir, f'test_ys_{label_type}.pkl')
+
+                 print(f"   DEBUG: Saving train labels to: {train_save_path}")
+                 U.save_info(train_save_path, train_labels_to_save)
+                 print(f"   DEBUG: Train labels saved? Exists: {os.path.exists(train_save_path)}, Size: {os.path.getsize(train_save_path) if os.path.exists(train_save_path) else 'N/A'} bytes")
+
+                 print(f"   DEBUG: Saving test labels to: {test_save_path}")
+                 U.save_info(test_save_path, test_labels_to_save)
+                 print(f"   DEBUG: Test labels saved? Exists: {os.path.exists(test_save_path)}, Size: {os.path.getsize(test_save_path) if os.path.exists(test_save_path) else 'N/A'} bytes")
+
+            except Exception as e_gen: # Catch other potential errors during label processing/saving
+                 print(f"[ERROR] Unexpected error processing/saving labels for '{label_type}': {e_gen}")
+                 raise # Re-raise
+
+        print("✅ Label files processing complete.")
+
+        # --- MODE DETECTION & HANDLING ---
+        xs_base_path = self.config['Xs']  # e.g., ".../anomalies/sentence_embedding"
+        base_dir = os.path.dirname(xs_base_path)
+        base_name = os.path.basename(xs_base_path)
+
+        # Candidate locations for metadata (parent dir and inside chunk folders)
+        candidates_meta = [
+            os.path.normpath(os.path.join(base_dir, f"{base_name}_metadata.pkl")),
+            os.path.normpath(os.path.join(base_dir, f"{base_name}", f"{base_name}_metadata.pkl")),
+            os.path.normpath(os.path.join(base_dir, f"{base_name}_chunked", f"{base_name}_metadata.pkl")),
+            os.path.normpath(os.path.join(base_dir, f"{base_name}_chunks", f"{base_name}_metadata.pkl")),
+        ]
+        metadata_path = next((p for p in candidates_meta if os.path.exists(p)), candidates_meta[0])
+
+        if os.path.exists(metadata_path):
+            # STREAMING MODE
+            print(f"📦 Streaming mode detected based on metadata file: {metadata_path}")
+            print("   Skipping embedding splitting. UnircaDataset will handle streaming.")
+
+            # Try likely chunk-folder names and pick the one that exists
+            candidate_chunk_dirs = [
+                os.path.normpath(f"{xs_base_path}_chunked"),
+                os.path.normpath(f"{xs_base_path}_chunks"),
+                os.path.normpath(os.path.join(base_dir, base_name, "sentence_embedding_chunked")),
+                os.path.normpath(os.path.join(base_dir, base_name, "sentence_embedding_chunks")),
+            ]
+            chunked_dir = next((d for d in candidate_chunk_dirs if os.path.isdir(d)), None)
+            if chunked_dir is None:
+                raise FileNotFoundError(
+                    f"Could not find any chunked directory for embeddings. Checked: {candidate_chunk_dirs}"
+                )
+
+            # Use absolute normalized chunk dir
+            chunked_dir = os.path.abspath(chunked_dir)
+            streaming_info = {'chunked_dir': chunked_dir}
+
+            # Determine target folders where the loader will look for placeholders.
+            # The loader earlier tried something like: <save_dir>/<lab_id>/train_Xs.pkl
+            # So write placeholder into save_dir and into any numeric child directories (safest).
+            target_dirs = [os.path.abspath(save_dir)]
+            # add any immediate numeric subfolders (e.g., 9, 10) where loader might look
+            try:
+                for entry in os.listdir(save_dir):
+                    full = os.path.join(save_dir, entry)
+                    if os.path.isdir(full) and entry.isdigit():
+                        target_dirs.append(os.path.abspath(full))
+            except FileNotFoundError:
+                pass
+
+            # Also, if config explicitly provides an experiment id / subfolder, respect it
+            exp_subdir = self.config.get('exp_subdir') or self.config.get('lab_id') or self.config.get('run_id')
+            if exp_subdir:
+                candidate = os.path.join(save_dir, str(exp_subdir))
+                if os.path.isdir(candidate) and os.path.abspath(candidate) not in target_dirs:
+                    target_dirs.append(os.path.abspath(candidate))
+
+            # write placeholders in all target dirs (redundant but robust)
+            for td in set(target_dirs):
+                os.makedirs(td, exist_ok=True)
+                placeholder_train = os.path.join(td, 'train_Xs_streaming.pkl')
+                placeholder_test = os.path.join(td, 'test_Xs_streaming.pkl')
+                try:
+                    with open(placeholder_train, 'wb') as f:
+                        pickle.dump(streaming_info, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    with open(placeholder_test, 'wb') as f:
+                        pickle.dump(streaming_info, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    print(f"   ✅ Streaming placeholders created in: {td} -> chunk dir: {chunked_dir}")
+                    # ... (saving placeholder_train) ...
+                    print(f"DEBUG RawDataProcess SAVE: Path='{placeholder_train}', Exists={os.path.exists(placeholder_train)}") # ADD THIS
+
+                    # ... (saving placeholder_test) ...
+                    print(f"DEBUG RawDataProcess SAVE: Path='{placeholder_test}', Exists={os.path.exists(placeholder_test)}") # ADD THIS
+
+                    print(f"✅ Streaming placeholders created successfully in: {save_dir}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to save streaming placeholder files in {td}: {e}")
+                    raise IOError(f"Could not create streaming placeholder files in {td}") from e
+
+        else:
+            # TRADITIONAL MODE
+            print(f"📁 Metadata file not found at '{metadata_path}'.")
+            single_xs_file = os.path.normpath(f"{xs_base_path}.pkl")
+            print(f"   Assuming traditional mode with single file: {single_xs_file}")
+            print("   Splitting embedding file (this may require significant memory)...")
+
+            if not os.path.exists(single_xs_file):
+                raise FileNotFoundError(f"Traditional mode failed: Input embedding file not found at {single_xs_file}")
+
+            print(f"   Loading single embedding file: {single_xs_file}...")
+            try:
+                with open(single_xs_file, 'rb') as f:
+                    Xs_all = pickle.load(f)
+            except Exception as e:
+                raise IOError(f"Failed to load single embedding file {single_xs_file}: {e}")
+
+            if len(Xs_all) != len(run_table):
+                print(f"[WARNING] Length mismatch! Embeddings ({len(Xs_all)}) vs Run Table ({len(run_table)}). Split might be incorrect.")
+
+            print(f"   Splitting into train ({len(train_index)} cases) and test ({len(test_index)} cases)...")
+            try:
+                train_Xs = [Xs_all[i] for i in train_index]
+                test_Xs = [Xs_all[i] for i in test_index]
+            except IndexError:
+                raise IndexError("Index out of bounds during train/test split. Check run_table indices vs embedding length.")
+            except TypeError:
+                raise TypeError("Failed to index embeddings. Ensure Xs_all is a list or indexable sequence.")
+
+            train_file_path = os.path.join(save_dir, 'train_Xs.pkl')
+            test_file_path = os.path.join(save_dir, 'test_Xs.pkl')
+
+            print(f"   Saving train embeddings to: {train_file_path}")
+            if 'pf' not in locals() and 'pf' not in globals():
+                import public_function as pf
+            try:
+                if hasattr(pf, 'save_chunked'):
+                    pf.save_chunked(train_file_path, train_Xs)
+                else:
+                    with open(train_file_path, 'wb') as f:
+                        pickle.dump(train_Xs, f, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as e:
+                print(f"[ERROR] Failed saving train_Xs: {e}")
+
+            print(f"   Saving test embeddings to: {test_file_path}")
+            try:
+                if hasattr(pf, 'save_chunked'):
+                    pf.save_chunked(test_file_path, test_Xs)
+                else:
+                    with open(test_file_path, 'wb') as f:
+                        pickle.dump(test_Xs, f, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as e:
+                print(f"[ERROR] Failed saving test_Xs: {e}")
+
+            del Xs_all, train_Xs, test_Xs
+            gc.collect()
+            print("✅ Traditional splitting complete.")
+
+        # --- Save Topology (Always happens) ---
+        print("💾 Saving topology...")
+        topology = self.get_topology()
+        U.save_info(os.path.join(save_dir, 'topology.pkl'), topology)
+        if self.config.get('heterogeneous', False):
+            print("💾 Saving edge types...")
+            edge_types = self.get_edge_types()
+            U.save_info(os.path.join(save_dir, 'edge_types.pkl'), edge_types)
+        print("✅ Topology/Edge types saved.")
+
                     
     def process_embeddings_chunked(self, xs_path, save_dir, train_index, test_index, label_dict):
         """Streaming process: never accumulate more than one chunk in memory"""
@@ -658,15 +799,6 @@ class RawDataProcess():
             # ...existing code...
     def get_label(self, label_type, run_table):
         """ process() 中调用，用来获取label
-        
-        Robust label extraction: returns numpy label indices (one per CASE).
-        
-        Heuristics:
-          1. Try to read embedding metadata to get total_cases first (PRIORITY)
-          2. If metadata exists and mismatch -> filter to first N cases
-          3. Else if 'case_id' present: drop duplicates by case_id
-          4. Else try common id columns or consecutive-run deduplication
-        
         参数
         ----------
         label_type: str
@@ -675,85 +807,31 @@ class RawDataProcess():
 
         返回值
         ----------
-        labels: numpy.ndarray
+        labels: torch.tensor()
             label列表
         """
+        # Return numpy array of integer labels for the given label_type.
+        # Robust handling:
+        #   - If the entire column is NaN: assign '[normal]'
+        #   - If partially NaN: fill those with '[unknown]'
+        #   - Placeholders are ordered to appear last in the label index.
         if label_type not in run_table.columns:
             raise ValueError(f"Missing column '{label_type}' in run_table. Columns: {list(run_table.columns)}")
 
-        # Normalize column, fill NaNs
-        col_full = run_table[label_type].astype(str).fillna("[unknown]").reset_index(drop=True)
+        col = run_table[label_type]
 
-        # 1) FIRST: Try to read total_cases from embedding metadata
-        total_cases = None
-        try:
-            xs_base = self.config.get('Xs', '')
-            base_dir = os.path.dirname(xs_base)
-            base_name = os.path.basename(xs_base).replace(".pkl", "")
-            candidates_meta = [
-                os.path.join(base_dir, f"{base_name}_metadata.pkl"),
-                os.path.join(base_dir, base_name, f"{base_name}_metadata.pkl"),
-                os.path.join(base_dir, f"{base_name}_chunked", f"{base_name}_metadata.pkl"),
-                os.path.join(base_dir, f"{base_name}_chunks", f"{base_name}_metadata.pkl"),
-            ]
-            meta_path = next((p for p in candidates_meta if os.path.exists(p)), None)
-            if meta_path:
-                with open(meta_path, 'rb') as mf:
-                    meta = pickle.load(mf)
-                total_cases = int(meta.get('total_cases', None)) if meta else None
-                print(f"[INFO] get_label: Found metadata with {total_cases} cases")
-        except Exception as e:
-            print(f"[DEBUG] get_label: Could not load metadata: {e}")
-            total_cases = None
-
-        # 2) If metadata exists and there's a mismatch -> filter/collapse
-        if total_cases and len(run_table) > total_cases:
-            print(f"[INFO] get_label: Filtering {len(run_table)} rows to {total_cases} cases (metadata-based)")
-            
-            # Check if case_id exists and is sequential
-            if 'case_id' in run_table.columns:
-                case_ids = run_table['case_id'].values
-                
-                # Check if case_ids are 0-based sequential
-                if case_ids.min() == 0 and case_ids.max() == len(run_table) - 1:
-                    # Filter to first total_cases rows
-                    run_filtered = run_table[run_table['case_id'] < total_cases].copy()
-                    col = run_filtered[label_type].astype(str).fillna("[unknown]").reset_index(drop=True)
-                    reason = f"filtered_to_first_{total_cases}_by_case_id"
-                else:
-                    # Case IDs are not sequential - use first total_cases unique case_ids
-                    unique_case_ids = run_table['case_id'].unique()[:total_cases]
-                    run_filtered = run_table[run_table['case_id'].isin(unique_case_ids)].copy()
-                    # Drop duplicates if any
-                    run_filtered = run_filtered.drop_duplicates(subset='case_id', keep='first')
-                    col = run_filtered[label_type].astype(str).fillna("[unknown]").reset_index(drop=True)
-                    reason = f"filtered_to_first_{total_cases}_unique_case_ids"
-            else:
-                # No case_id column - just take first total_cases rows
-                run_filtered = run_table.iloc[:total_cases].copy()
-                col = run_filtered[label_type].astype(str).fillna("[unknown]").reset_index(drop=True)
-                reason = f"sliced_first_{total_cases}_rows"
-        
-        # 3) Else if case_id exists with duplicates -> deduplicate
-        elif 'case_id' in run_table.columns:
-            unique_cases = run_table['case_id'].nunique()
-            if unique_cases < len(run_table):
-                run_per_case = run_table.drop_duplicates(subset='case_id', keep='first')
-                col = run_per_case[label_type].astype(str).fillna("[unknown]").reset_index(drop=True)
-                reason = "drop_duplicates(case_id)"
-            else:
-                col = col_full.copy()
-                reason = "kept_full_rows(unique_case_ids)"
-        
-        # 4) Fallback - keep all rows
+        if col.isna().all():
+            print(f"[warn] Column '{label_type}' all NaN; assigning '[normal]'.")
+            col = pd.Series(["[normal]"] * len(col), index=col.index)
         else:
-            col = col_full.copy()
-            reason = "kept_full_rows(no_metadata_no_case_id)"
+            if col.isna().any():
+                print(f"[info] Column '{label_type}' had {int(col.isna().sum())} NaNs -> filled with '[unknown]'.")
+            col = col.fillna("[unknown]")
 
-        # Final normalize & ordering
-        col = col.astype(str).fillna("[unknown]").reset_index(drop=True)
+        col = col.astype(str)
+
         unique = sorted(set(col))
-        placeholders = ["[unknown]", "[normal]", "nan"]
+        placeholders = ["[unknown]", "[normal]"]
         ordered = [u for u in unique if u not in placeholders]
         for ph in placeholders:
             if ph in unique:
@@ -761,9 +839,6 @@ class RawDataProcess():
 
         labels_idx = {v: i for i, v in enumerate(ordered)}
         labels = col.map(labels_idx).to_numpy()
-        
-        print(f"[INFO] get_label: Generated {len(labels)} '{label_type}' labels (method: {reason})")
-        
         # Save service label list for reverse mapping later
         if label_type == 'service':
             try:
@@ -771,7 +846,7 @@ class RawDataProcess():
                 U.save_info(os.path.join(self.config['save_dir'], 'service_label_list.pkl'), ordered)
             except Exception as e:
                 print(f"[warn] could not save service_label_list.pkl: {e}")
-        return labels, reason, ordered
+        return labels
 
     def get_topology(self):
         """ process() 中调用，用来获取topology
@@ -1488,33 +1563,6 @@ class UnircaLab():
                 accs, ins_res = self.test_instance_local(ser_res, max_num=2)
                 ins_res.to_csv(f'{out_dir}/multitask_seed{seed}_{out_file}')
                 columns = ['A@1', 'A@2', 'A@3', 'A@4', 'A@5']
-            elif task == 'service':
-                # Top-k for service-group head
-                _, indices = torch.topk(output, k=k, dim=1, largest=True, sorted=True)
-                out_dir = os.path.join(self.config['save_dir'], 'preds')
-                if not os.path.exists(out_dir):
-                    os.makedirs(out_dir)
-                y_pred = indices.detach().cpu().numpy()
-                y_true = labels.detach().cpu().numpy().reshape(-1, 1)
-
-                # compute weighted metrics (service is multi-class similar to anomaly)
-                pre = precision_score(y_true, y_pred[:, 0], average='weighted')
-                rec = recall_score(y_true, y_pred[:, 0], average='weighted')
-                f1 = f1_score(y_true, y_pred[:, 0], average='weighted')
-                print('Weighted precision (service):', pre)
-                print('Weighted recall    (service):', rec)
-                print('Weighted f1-score  (service):', f1)
-
-                # save predictions (same format as anomaly)
-                ser_res = pd.DataFrame(np.append(y_pred, y_true, axis=1),
-                                       columns=np.append([f'Top{i}' for i in range(1, len(y_pred[0])+1)], 'GroundTruth'))
-                ins_dir = os.path.join(self.config['save_dir'], 'preds')
-                if not os.path.exists(ins_dir):
-                    os.makedirs(ins_dir)
-                ser_res.to_csv(f'{ins_dir}/multitask_seed{seed}_{out_file}')
-
-                columns = ['Precision', 'Recall', 'F1-Score']
-                accs = np.array([pre, rec, f1])
             elif task == 'anomaly_type':
                 _, indices = torch.topk(output, k=k, dim=1, largest=True, sorted=True)  
                 out_dir = os.path.join(self.config['save_dir'], 'preds')
@@ -1534,7 +1582,7 @@ class UnircaLab():
                 output_df = pd.DataFrame(np.append(
                     y_pred[:, 0].reshape(-1, 1), y_true, axis=1), 
                     columns=['Pred', 'GroundTruth']) 
-
+                
                 output_csv_path = f'{out_dir}/multitask_seed{seed}_{out_file}'
                 # Save without specifying the incorrect index, and don't write pandas index to CSV
                 output_df.to_csv(output_csv_path, index=False) 
@@ -1609,38 +1657,37 @@ class UnircaLab():
             labels_ts = ts_samples[i][1].to(device)
             labels_ta = ta_samples[i][1].to(device)
             output_ts, output_ta = model(batched_graph, batched_graph.ndata['attr'].float())
-        print('instance')
-        _, _ = self.testv2( model_ts,
-                    UnircaDataset(test_xs_path, os.path.join(save_dir, 'test_ys_service.pkl'), os.path.join(save_dir, 'topology.pkl')),
-                    'instance',
-                    'instance_pred_multi_v0.csv',
-                    'instance_acc_multi_v0.csv')
-
-        print('service')
-        _, _ = self.testv2( model_ts,
-                    UnircaDataset(test_xs_path, os.path.join(save_dir, 'test_ys_service.pkl'), os.path.join(save_dir, 'topology.pkl')),
-                    'service',
-                    'service_pred_multi_v0.csv',
-                    'service_acc_multi_v0.csv')
-
-        print('anomaly type')
-        _, _ = self.testv2( model_ta,
-                    UnircaDataset(test_xs_path, os.path.join(save_dir, 'test_ys_anomaly_type.pkl'), os.path.join(save_dir, 'topology.pkl')),
-                    'anomaly_type',
-                    'anomaly_pred_multi_v0.csv',
-                    'anomaly_acc_multi_v0.csv')
+            print('service')
+            for k in range(1, 6):
+                _, indices_ts = torch.topk(output_ts, k=k, dim=1, largest=True, sorted=True)
+                
+                # 保存Top5的根因微服务组定位预测结果---->实例定位结果
+                if k == 5:
+                    out_dir = os.path.join(self.config['save_dir'], 'preds')
+                    if not os.path.exists(out_dir):
+                        os.makedirs(out_dir)
+                    y_pred = indices_ts.detach().cpu().numpy()
+                    y_true = labels_ts.detach().cpu().numpy().reshape(-1, 1)
+                    # pd.DataFrame(np.append(y_pred, y_true, axis=1), columns=['Top1', 'Top2', 'Top3', 'Top4', 'Top5', 'GroundTruth']).to_csv(f'{out_dir}/multitask_seed{seed}_{out_file}')
+                    ser_res = pd.DataFrame(np.append(y_pred, y_true, axis=1), columns=
+                                           np.append([f'Top{i}' for i in range(1, len(y_pred[0])+1)], 'GroundTruth'))
+                    # 定位到实例级别
+                    print('instance')
+                    _, ins_res = self.test_instance_local(ser_res, 2)
+                    ins_res.to_csv(f'{out_dir}/multitask_seed{seed}_{out_file}')
+                      
                 # num_ts = 0
                 # for i in range(len(indices_ts)):
                 #     num_ts += indices_ts[i].eq(labels_ts[i]).sum().item()
                 # print(f'top{k} acc: ', num_ts / len(indices_ts))
                 # accuracy_ts.append([k, num_ts / len(indices_ts)])
                 
-        print('anomaly type') # anomaly type需要求pre、rec、f1
-        for k in range(1, 6):
-            _, indices_ta = torch.topk(output_ta, k=k, dim=1, largest=True, sorted=True)
-            num_ta = 0
-            for i in range(len(indices_ta)):
-                num_ta += indices_ta[i].eq(labels_ta[i]).sum().item()
+            print('anomaly type') # anomaly type需要求pre、rec、f1
+            for k in range(1, 6):
+                _, indices_ta = torch.topk(output_ta, k=k, dim=1, largest=True, sorted=True)
+                num_ta = 0
+                for i in range(len(indices_ta)):
+                    num_ta += indices_ta[i].eq(labels_ta[i]).sum().item()
                 print(f'top{k} acc: ', num_ta / len(indices_ta))
                 accuracy_ts.append([k, num_ta / len(indices_ta)])
 
@@ -1850,12 +1897,7 @@ class UnircaLab():
             os.makedirs(save_dir)
         # Update config's save_dir to point to the specific lab_id folder
         self.config['save_dir'] = save_dir 
-        RawDataProcess(self.config).process(
-            runtable_path=self.config['run_table'],
-            xs_path=self.config['Xs'],
-            ys_task=['service', 'anomaly_type'],
-            save_dir=save_dir
-        )
+        RawDataProcess(self.config).process()
         
         # Check label diversity to warn about meaningless training
         try:
